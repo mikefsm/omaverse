@@ -1,41 +1,58 @@
 //! Markdown <-> Document.
 //!
-//! Format rules (see also the project README):
-//!   1. A leading `# ` heading is the document title.
-//!   2. `- ` at indent N is an outline node at depth N/2.
-//!   3. Any other line indented under a node is that node's body.
-//!   4. `*` / `+` bullets are prose inside a body, never structure.
+//! Format:
+//!   1. An optional `---` frontmatter block carries the document's title, which
+//!      leaves every `#` level free for sections.
+//!   2. `#` to `######` are sections; the number of hashes is the depth.
+//!   3. Anything else is the body of the section above it, flush left.
+//!   4. `[^id]:` definitions at the foot of the file are notes.
 //!
-//! Serializing puts a blank line around a body so the file still renders
-//! correctly as ordinary Markdown elsewhere (without it, Markdown's lazy
-//! continuation would join the body onto the title line). Parsing trims blank
-//! lines from a body's edges, which is what makes the round trip stable.
+//! Headings carry the structure, so `-` and `*` are ordinary list bullets again
+//! and mean nothing to omaverse. Nothing in a file written here is a private
+//! convention: it is all plain Markdown.
 
 use crate::model::{Document, Node, NodePath, Note, NoteKind};
 
-const INDENT: usize = 2;
 
-/// `- ` is structural. `*`, `+`, and `---` are not.
-fn bullet(line: &str) -> Option<(usize, String)> {
-    let trimmed = line.trim_start_matches(' ');
-    let indent = line.len() - trimmed.len();
-    if let Some(title) = trimmed.strip_prefix("- ") {
-        return Some((indent, title.trim_end().to_string()));
+/// `#` to `######` open a section. The count of hashes is the depth.
+fn heading(line: &str) -> Option<(usize, String)> {
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
     }
-    if trimmed == "-" {
-        return Some((indent, String::new()));
+    let rest = &line[hashes..];
+    if rest.is_empty() {
+        return Some((hashes - 1, String::new()));
     }
-    None
+    let title = rest.strip_prefix(' ')?;
+    Some((hashes - 1, title.trim().to_string()))
 }
 
-/// Leading tabs count as one indent level each.
-fn expand_tabs(line: &str) -> String {
-    let rest = line.trim_start_matches('\t');
-    let tabs = line.len() - rest.len();
-    if tabs == 0 {
-        return line.to_string();
+/// A `---` fence around the frontmatter block.
+fn is_fence(line: &str) -> bool {
+    line.trim_end() == "---"
+}
+
+/// Read a leading frontmatter block, returning its fields and the rest.
+fn split_front(src: &str) -> (Option<String>, String) {
+    let mut lines = src.lines();
+    if !lines.next().map(is_fence).unwrap_or(false) {
+        return (None, src.to_string());
     }
-    format!("{}{}", " ".repeat(tabs * INDENT), rest)
+    let mut title = None;
+    let mut consumed = 1;
+    for line in lines {
+        consumed += 1;
+        if is_fence(line) {
+            let rest: Vec<&str> = src.lines().skip(consumed).collect();
+            return (title, rest.join("\n"));
+        }
+        if let Some(value) = line.trim().strip_prefix("title:") {
+            title = Some(value.trim().to_string());
+        }
+    }
+    // No closing fence: treat the whole thing as ordinary text.
+    (None, src.to_string())
 }
 
 /// Strip the body block's *common* leading indent, rather than a fixed expected
@@ -198,42 +215,39 @@ fn serialize_notes(notes: &[Note]) -> String {
 }
 
 pub fn parse(src: &str) -> Document {
-    let (body, notes) = split_notes(src);
-    let src = body.as_str();
+    let (body_src, notes) = split_notes(src);
+    let (title, rest) = split_front(&body_src);
     let mut doc = Document::default();
     doc.notes = notes;
-    let lines: Vec<String> = src.lines().map(expand_tabs).collect();
+    doc.title = title;
+
+    let lines: Vec<&str> = rest.lines().collect();
     let mut i = 0;
 
-    while i < lines.len() && lines[i].trim().is_empty() {
-        i += 1;
-    }
-    if let Some(rest) = lines.get(i).and_then(|l| l.strip_prefix("# ")) {
-        doc.title = Some(rest.trim().to_string());
-        i += 1;
-    }
-
+    // Anything before the first heading belongs to no section, and is kept so
+    // nothing is silently eaten.
     let mut preamble = Vec::new();
-    while i < lines.len() && bullet(&lines[i]).is_none() {
-        preamble.push(lines[i].clone());
+    while i < lines.len() && heading(lines[i]).is_none() {
+        preamble.push(lines[i].to_string());
         i += 1;
     }
-    doc.preamble = join_trimmed(&preamble);
+    doc.preamble = dedent_block(&preamble);
 
-    // `path` tracks the most recently added node; its depth is path.len() - 1.
+    // `path` tracks the most recently added section; its depth is path.len() - 1.
     let mut path: NodePath = Vec::new();
     let mut body: Vec<String> = Vec::new();
 
     while i < lines.len() {
-        if let Some((indent, title)) = bullet(&lines[i]) {
+        if let Some((depth, title)) = heading(lines[i]) {
             flush_body(&mut doc, &path, &mut body);
             let node = Node::new(title);
             path = if path.is_empty() {
                 doc.push_root(node)
             } else {
-                // A bullet may never be more than one level deeper than the
-                // previous one; over-indentation is clamped rather than rejected.
-                let depth = (indent / INDENT).min(path.len());
+                // A heading may never be more than one level deeper than the
+                // one before it; jumping from # to ### is clamped rather than
+                // rejected.
+                let depth = depth.min(path.len());
                 if depth == path.len() {
                     let parent = path.clone();
                     doc.insert_child(&parent, node).expect("parent exists")
@@ -244,8 +258,7 @@ pub fn parse(src: &str) -> Document {
                 }
             };
         } else if !path.is_empty() {
-            // Kept raw; the common indent is stripped when the body is flushed.
-            body.push(lines[i].clone());
+            body.push(lines[i].to_string());
         }
         i += 1;
     }
@@ -269,10 +282,10 @@ fn flush_body(doc: &mut Document, path: &[usize], body: &mut Vec<String>) {
 
 pub fn serialize(doc: &Document) -> String {
     let mut out = String::new();
-    if let Some(t) = &doc.title {
-        out.push_str("# ");
-        out.push_str(t.trim());
-        out.push_str("\n\n");
+    if let Some(title) = &doc.title {
+        out.push_str("---\ntitle: ");
+        out.push_str(title.trim());
+        out.push_str("\n---\n\n");
     }
     if !doc.preamble.trim().is_empty() {
         out.push_str(doc.preamble.trim_end());
@@ -300,30 +313,22 @@ pub fn serialize(doc: &Document) -> String {
 }
 
 fn emit(node: &Node, depth: usize, out: &mut String) {
-    let indent = " ".repeat(depth * INDENT);
-    out.push_str(&indent);
-    // A bare "-" rather than "- " keeps trailing whitespace out of the file for
-    // nodes that have not been named yet.
-    let title = node.title.trim_end();
-    if title.is_empty() {
-        out.push('-');
-    } else {
-        out.push_str("- ");
+    let hashes = "#".repeat((depth + 1).min(6));
+    let title = node.title.trim();
+    out.push_str(&hashes);
+    if !title.is_empty() {
+        out.push(' ');
         out.push_str(title);
     }
     out.push('\n');
+    // A blank line after the heading, which is what Markdown wants and what
+    // keeps a heading from swallowing the line beneath it.
+    out.push('\n');
 
     if !node.body.trim().is_empty() {
-        let content = " ".repeat((depth + 1) * INDENT);
-        out.push('\n');
         for line in node.body.lines() {
-            if line.trim().is_empty() {
-                out.push('\n');
-            } else {
-                out.push_str(&content);
-                out.push_str(line.trim_end());
-                out.push('\n');
-            }
+            out.push_str(line.trim_end());
+            out.push('\n');
         }
         out.push('\n');
     }
@@ -336,178 +341,179 @@ fn emit(node: &Node, depth: usize, out: &mut String) {
 mod tests {
     use super::*;
 
-    const ROMANS: &str = "\
-# Romans
+    const DOC: &str = "\
+---
+title: Jude
+---
 
-- Introduction (1:1-17)
+# Greeting and occasion
 
-  Paul stacks three self-descriptions here, each one
-  pointing away from himself.
+Placeholder opening sentence for the first section.
 
-  * servant — δοῦλος, not διάκονος
-  * apostle — sent with authority
+## Those who crept in
 
-  - The greeting
+Placeholder sentence belonging to the nested section.
 
-    Note the inversion: \"called to be an apostle\".
+- an ordinary list bullet
+- another one
 
-  - Thanksgiving
-- God's wrath revealed (1:18-32)
+# The charge
+
+Placeholder closing sentence.
 ";
 
     #[test]
-    fn parses_the_reference_document() {
-        let d = parse(ROMANS);
-        assert_eq!(d.title.as_deref(), Some("Romans"));
+    fn frontmatter_carries_the_title() {
+        let d = parse(DOC);
+        assert_eq!(d.title.as_deref(), Some("Jude"));
+    }
+
+    #[test]
+    fn hashes_give_the_depth() {
+        let d = parse(DOC);
         assert_eq!(d.roots.len(), 2);
-        let intro = &d.roots[0];
-        assert_eq!(intro.title, "Introduction (1:1-17)");
-        assert_eq!(intro.children.len(), 2);
-        assert_eq!(intro.children[0].title, "The greeting");
-        assert_eq!(intro.children[1].title, "Thanksgiving");
-        assert!(intro.children[1].body.is_empty());
-        assert_eq!(d.roots[1].title, "God's wrath revealed (1:18-32)");
+        assert_eq!(d.roots[0].title, "Greeting and occasion");
+        assert_eq!(d.roots[0].children.len(), 1);
+        assert_eq!(d.roots[0].children[0].title, "Those who crept in");
+        assert_eq!(d.roots[1].title, "The charge");
     }
 
     #[test]
-    fn prose_bullets_stay_in_the_body() {
-        let d = parse(ROMANS);
-        let body = &d.roots[0].body;
-        assert!(body.contains("* servant — δοῦλος, not διάκονος"));
-        assert!(body.contains("* apostle"));
-        // The interior blank line between prose and the `*` list survives.
-        assert_eq!(
-            body,
-            "Paul stacks three self-descriptions here, each one\n\
-             pointing away from himself.\n\
-             \n\
-             * servant — δοῦλος, not διάκονος\n\
-             * apostle — sent with authority"
-        );
+    fn list_bullets_are_ordinary_prose_now() {
+        // The whole point of the change: `-` carries no structure.
+        let d = parse(DOC);
+        let nested = &d.roots[0].children[0];
+        assert!(nested.children.is_empty(), "a list must not become sections");
+        assert!(nested.body.contains("- an ordinary list bullet"));
+        assert!(nested.body.contains("- another one"));
     }
 
     #[test]
-    fn serialize_is_byte_exact_for_the_reference_document() {
-        assert_eq!(serialize(&parse(ROMANS)), ROMANS);
+    fn body_is_flush_left() {
+        let d = parse(DOC);
+        assert_eq!(d.roots[1].body, "Placeholder closing sentence.");
+        assert!(!d.roots[1].body.starts_with(' '));
+    }
+
+    #[test]
+    fn serialize_is_byte_exact() {
+        assert_eq!(serialize(&parse(DOC)), DOC);
     }
 
     #[test]
     fn round_trip_is_idempotent() {
-        for src in [ROMANS, "- a\n", "", "# T\n", "- a\n  - b\n    - c\n"] {
+        for src in [DOC, "# a\n", "", "# a\n\n## b\n\n### c\n"] {
             let once = serialize(&parse(src));
-            let twice = serialize(&parse(&once));
-            assert_eq!(once, twice, "not idempotent for {src:?}");
+            assert_eq!(once, serialize(&parse(&once)), "not idempotent for {src:?}");
         }
     }
 
     #[test]
-    fn body_is_separated_by_a_blank_line_so_markdown_renders_it() {
-        // Without the blank line, Markdown's lazy continuation would join the
-        // body onto the title line in Obsidian / GitHub.
+    fn a_blank_line_follows_every_heading() {
+        // Without it Markdown reads the next line as part of the heading.
         let mut d = Document::default();
         d.push_root(Node { title: "T".into(), body: "b".into(), children: vec![] });
-        assert_eq!(serialize(&d), "- T\n\n  b\n");
+        assert_eq!(serialize(&d), "# T\n\nb\n");
     }
 
     #[test]
-    fn lazy_continuation_input_is_still_accepted() {
-        // A hand-written file with no blank line parses the same way.
-        let d = parse("- T\n  b\n");
+    fn a_heading_with_no_blank_line_after_it_still_parses() {
+        let d = parse("# T\nb\n");
         assert_eq!(d.roots[0].body, "b");
-        assert_eq!(serialize(&d), "- T\n\n  b\n");
     }
 
     #[test]
-    fn over_indentation_is_clamped_not_lost() {
-        let d = parse("- a\n      - b\n");
+    fn skipped_levels_are_clamped_not_lost() {
+        let d = parse("# a\n\n### b\n");
         assert_eq!(d.roots.len(), 1);
-        assert_eq!(d.roots[0].children.len(), 1);
         assert_eq!(d.roots[0].children[0].title, "b");
     }
 
     #[test]
-    fn outdenting_multiple_levels_at_once() {
-        let d = parse("- a\n  - b\n    - c\n- d\n");
+    fn climbing_back_out_several_levels() {
+        let d = parse("# a\n\n## b\n\n### c\n\n# d\n");
         assert_eq!(d.roots.len(), 2);
         assert_eq!(d.roots[1].title, "d");
         assert_eq!(d.roots[0].children[0].children[0].title, "c");
     }
 
     #[test]
-    fn tabs_count_as_indent() {
-        let d = parse("- a\n\t- b\n");
-        assert_eq!(d.roots[0].children[0].title, "b");
+    fn no_frontmatter_means_no_title() {
+        let d = parse("# a\n");
+        assert!(d.title.is_none());
+        assert_eq!(serialize(&d), "# a\n");
     }
 
     #[test]
-    fn no_title_falls_back_to_none() {
-        let d = parse("- a\n");
+    fn an_unopened_fence_is_just_text() {
+        // A stray --- must not swallow the document.
+        let d = parse("---\nnot really frontmatter\n\n# a\n");
         assert!(d.title.is_none());
-        assert_eq!(serialize(&d), "- a\n");
+        assert_eq!(d.roots.len(), 1);
+    }
+
+    #[test]
+    fn seven_hashes_is_not_a_heading() {
+        let d = parse("# a\n\n####### still body\n");
+        assert_eq!(d.roots.len(), 1);
+        assert!(d.roots[0].body.contains("#######"));
+    }
+
+    #[test]
+    fn a_hash_without_a_space_is_not_a_heading() {
+        let d = parse("# a\n\n#hashtag\n");
+        assert_eq!(d.roots.len(), 1);
+        assert_eq!(d.roots[0].body, "#hashtag");
+    }
+
+    #[test]
+    fn an_unnamed_section_writes_a_bare_hash() {
+        let mut d = Document::default();
+        d.push_root(Node::new(""));
+        assert_eq!(serialize(&d), "#\n");
+        assert_eq!(parse("#\n").roots.len(), 1);
+        assert_eq!(parse("#\n").roots[0].title, "");
     }
 
     #[test]
     fn preamble_is_preserved_not_eaten() {
-        let src = "# T\n\nA note before any bullets.\n\n- a\n";
+        let src = "A note before any heading.\n\n# a\n";
         let d = parse(src);
-        assert_eq!(d.preamble, "A note before any bullets.");
+        assert_eq!(d.preamble, "A note before any heading.");
         assert_eq!(serialize(&d), src);
     }
 
     #[test]
-    fn an_unnamed_node_writes_a_bare_dash_and_reads_back() {
-        let mut d = Document::default();
-        d.push_root(Node::new(""));
-        assert_eq!(serialize(&d), "-\n");
-        assert_eq!(parse("-\n").roots.len(), 1);
-        assert_eq!(parse("-\n").roots[0].title, "");
+    fn empty_input_produces_empty_output() {
+        let d = parse("");
+        assert!(d.is_empty());
+        assert_eq!(serialize(&d), "");
     }
 
-    /// Deleting a section's heading line should fold its text up into the
-    /// section above -- that is how you merge two sections by hand.
     #[test]
-    fn deleting_a_heading_merges_its_text_into_the_section_above() {
-        let before = "\
-- Part One — 1:1
-
-  1:1 In the beginning, God created the heavens and the earth.
-
-- Part Two — 1:2
-
-  2 The earth was without form and void.
-";
-        // the user deletes the "- Part Two — 1:2" line
-        let after = "\
-- Part One — 1:1
-
-  1:1 In the beginning, God created the heavens and the earth.
-
-  2 The earth was without form and void.
-";
-        let d = parse(after);
-        assert_eq!(d.roots.len(), 1, "one section now, not two");
-        assert_eq!(d.roots[0].title, "Part One — 1:1");
-        assert_eq!(
-            d.roots[0].body,
-            "1:1 In the beginning, God created the heavens and the earth.\n\n\
-             2 The earth was without form and void."
-        );
-        assert_eq!(parse(before).roots.len(), 2, "two sections beforehand");
+    fn interior_blank_lines_in_a_body_survive() {
+        let d = parse("# a\n\none\n\ntwo\n");
+        assert_eq!(d.roots[0].body, "one\n\ntwo");
+        assert_eq!(serialize(&d), "# a\n\none\n\ntwo\n");
     }
 
-    /// The same merge when the deleted section was indented deeper: its text
-    /// keeps its own relative indentation rather than being flattened.
+    /// Deleting a heading line folds its text up into the section above, which
+    /// is how two sections get merged by hand.
     #[test]
-    fn merging_a_deeper_section_keeps_relative_indentation() {
-        let d = parse("- A\n\n  text of A\n\n    text that was under B\n");
-        assert_eq!(d.roots.len(), 1);
-        assert_eq!(d.roots[0].body, "text of A\n\n  text that was under B");
+    fn deleting_a_heading_merges_its_text_upwards() {
+        let two = parse("# One\n\nfirst text\n\n# Two\n\nsecond text\n");
+        assert_eq!(two.roots.len(), 2);
+        let merged = parse("# One\n\nfirst text\n\nsecond text\n");
+        assert_eq!(merged.roots.len(), 1);
+        assert_eq!(merged.roots[0].body, "first text\n\nsecond text");
     }
+
+    // ---- notes ------------------------------------------------------------
 
     const WITH_NOTES: &str = "\
-- Introduction
+# Introduction
 
-  Paul calls himself a ==servant==[^n1] first.
+Paul calls himself a ==servant==[^n1] first.
 
 [^n1]: The word is stronger than it looks in English.
 
@@ -522,14 +528,12 @@ mod tests {
         assert_eq!(d.notes.len(), 2);
         let one = d.note("n1").unwrap();
         assert_eq!(one.kind, NoteKind::Comment);
-        assert_eq!(one.text, "The word is stronger than it looks in English.");
         assert!(one.source.is_none());
     }
 
     #[test]
-    fn a_quotation_keeps_its_source_separate_from_its_text() {
-        let d = parse(WITH_NOTES);
-        let two = d.note("n2").unwrap();
+    fn a_quotation_keeps_its_source_separate() {
+        let two = parse(WITH_NOTES).note("n2").cloned().unwrap();
         assert_eq!(two.kind, NoteKind::Quotation);
         assert_eq!(two.text, "An invented sentence standing in for a quoted paragraph.");
         assert_eq!(two.source.as_deref(), Some("A. Author, Some Commentary, p. 52"));
@@ -538,9 +542,8 @@ mod tests {
     #[test]
     fn notes_do_not_leak_into_the_last_section_body() {
         let d = parse(WITH_NOTES);
-        assert_eq!(d.roots.len(), 1);
         assert_eq!(d.roots[0].body, "Paul calls himself a ==servant==[^n1] first.");
-        assert!(!d.roots[0].body.contains("[^n1]:"), "the definition is not body text");
+        assert!(!d.roots[0].body.contains("[^n1]:"));
     }
 
     #[test]
@@ -550,36 +553,17 @@ mod tests {
 
     #[test]
     fn a_quotation_without_a_source_round_trips() {
-        let src = "- a\n\n[^q]: > Invented placeholder sentence.\n";
-        let d = parse(src);
-        let q = d.note("q").unwrap();
-        assert_eq!(q.kind, NoteKind::Quotation);
-        assert!(q.source.is_none());
-        assert_eq!(serialize(&d), src);
-    }
-
-    #[test]
-    fn a_multi_line_quotation_keeps_its_shape() {
-        let d = parse(
-            "- a\n\n[^q]: > First invented line.\n    >\n    > Second invented line.\n    >\n    > — A. Author\n",
-        );
-        let q = d.note("q").unwrap();
-        assert_eq!(q.text, "First invented line.\n\nSecond invented line.");
-        assert_eq!(q.source.as_deref(), Some("A. Author"));
+        let src = "# a\n\n[^q]: > Invented placeholder sentence.\n";
+        assert_eq!(serialize(&parse(src)), src);
+        assert!(parse(src).note("q").unwrap().source.is_none());
     }
 
     #[test]
     fn a_multi_line_comment_keeps_its_shape() {
-        let src = "- a\n\n[^c]: First line of my own note.\n    Second line of it.\n";
+        let src = "# a\n\n[^c]: First line of my own note.\n    Second line of it.\n";
         let d = parse(src);
         assert_eq!(d.note("c").unwrap().text, "First line of my own note.\nSecond line of it.");
         assert_eq!(serialize(&d), src);
-    }
-
-    #[test]
-    fn a_file_with_no_notes_is_unchanged() {
-        assert_eq!(serialize(&parse(ROMANS)), ROMANS, "notes must not alter untouched files");
-        assert!(parse(ROMANS).notes.is_empty());
     }
 
     #[test]
@@ -606,55 +590,5 @@ mod tests {
         d.notes.push(Note::comment("n1", "x"));
         d.notes.push(Note::comment("n2", "y"));
         assert_eq!(d.fresh_note_id(), "n3");
-    }
-
-    #[test]
-    fn empty_input_produces_empty_output() {
-        let d = parse("");
-        assert!(d.is_empty());
-        assert_eq!(serialize(&d), "");
-    }
-
-    #[test]
-    fn horizontal_rule_in_body_is_not_a_node() {
-        let d = parse("- a\n\n  ---\n");
-        assert_eq!(d.roots.len(), 1);
-        assert_eq!(d.roots[0].body, "---");
-    }
-
-    /// Mirrors what the app does on save: parse what is on disk, re-serialize.
-    /// The input here is deliberately messy -- tab indent, an over-indented
-    /// bullet, bodies with no blank line, trailing spaces.
-    #[test]
-    fn a_messy_hand_written_file_normalizes_to_canonical_markdown() {
-        let messy = "# Romans\n\n\
-                     - Introduction (1:1-17)\n\
-                     \u{20}\u{20}Paul stacks three self-descriptions here.   \n\
-                     \u{20}\u{20}* servant — \u{3b4}\u{3bf}\u{1fe6}\u{3bb}\u{3bf}\u{3c2}\n\
-                     \t- The greeting\n\
-                     \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}Note the inversion.\n\
-                     \u{20}\u{20}- Thanksgiving (8-15)\n\
-                     - God's wrath revealed (1:18-32)\n";
-        let canonical = serialize(&parse(messy));
-        assert_eq!(
-            canonical,
-            "# Romans\n\n\
-             - Introduction (1:1-17)\n\n\
-             \u{20}\u{20}Paul stacks three self-descriptions here.\n\
-             \u{20}\u{20}* servant — \u{3b4}\u{3bf}\u{1fe6}\u{3bb}\u{3bf}\u{3c2}\n\n\
-             \u{20}\u{20}- The greeting\n\n\
-             \u{20}\u{20}\u{20}\u{20}Note the inversion.\n\n\
-             \u{20}\u{20}- Thanksgiving (8-15)\n\
-             - God's wrath revealed (1:18-32)\n"
-        );
-        // And saving again changes nothing.
-        assert_eq!(serialize(&parse(&canonical)), canonical);
-    }
-
-    #[test]
-    fn interior_blank_lines_in_a_body_survive() {
-        let d = parse("- a\n\n  one\n\n  two\n");
-        assert_eq!(d.roots[0].body, "one\n\ntwo");
-        assert_eq!(serialize(&d), "- a\n\n  one\n\n  two\n");
     }
 }

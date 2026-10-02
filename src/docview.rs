@@ -18,16 +18,14 @@ pub enum Line {
     /// Body text belonging to the section at `depth`. `indent` counts the
     /// leading spaces to hide.
     Body { depth: usize, indent: usize },
-    /// The document's own `# ` title. Not a section: it cannot be folded, it
-    /// has no place in the outline, and it should not look like one.
-    Title,
+    /// A line of the `---` frontmatter block. Apparatus, not prose.
+    Front,
     /// A note definition at the foot of the file. Apparatus, not prose, so it
     /// is set apart rather than read as part of the text.
     NoteDef,
     Blank,
 }
 
-const INDENT: usize = 2;
 /// Depths beyond this share the innermost style rather than shrinking forever.
 pub const MAX_DEPTH: usize = 5;
 
@@ -39,9 +37,24 @@ pub fn classify(text: &str) -> Vec<Line> {
     // Notes live at the foot of the file, so everything from the first
     // definition on is apparatus.
     let mut in_notes = false;
-    for raw in text.lines() {
+    // Frontmatter, if present, is the block fenced by --- at the very top.
+    let mut in_front = text.lines().next().map(|l| l.trim_end() == "---").unwrap_or(false);
+    let mut front_done = !in_front;
+
+    for (i, raw) in text.lines().enumerate() {
         let trimmed = raw.trim_start_matches(' ');
         let indent = raw.len() - trimmed.len();
+
+        if in_front {
+            out.push(Line::Front);
+            if i > 0 && raw.trim_end() == "---" {
+                in_front = false;
+                front_done = true;
+            }
+            continue;
+        }
+        let _ = front_done;
+
         if trimmed.starts_with("[^") && trimmed.contains("]:") && indent == 0 {
             in_notes = true;
             out.push(Line::NoteDef);
@@ -53,20 +66,31 @@ pub fn classify(text: &str) -> Vec<Line> {
         }
         if trimmed.is_empty() {
             out.push(Line::Blank);
-        } else if let Some(rest) = trimmed.strip_prefix("- ") {
-            let _ = rest;
-            depth = indent / INDENT;
-            out.push(Line::Heading { depth, marker: indent + 2 });
-        } else if trimmed == "-" {
-            depth = indent / INDENT;
-            out.push(Line::Heading { depth, marker: indent + 1 });
-        } else if trimmed.starts_with("# ") && indent == 0 {
-            out.push(Line::Title);
-        } else {
-            out.push(Line::Body { depth, indent });
+            continue;
+        }
+        match atx(raw) {
+            Some((d, marker)) => {
+                depth = d;
+                out.push(Line::Heading { depth, marker });
+            }
+            None => out.push(Line::Body { depth, indent }),
         }
     }
     out
+}
+
+/// `#` to `######` at the start of a line: the depth, and how many characters
+/// of marker to hide.
+fn atx(line: &str) -> Option<(usize, usize)> {
+    let hashes = line.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    match line.chars().nth(hashes) {
+        None => Some((hashes - 1, hashes)),
+        Some(' ') => Some((hashes - 1, hashes + 1)),
+        Some(_) => None,
+    }
 }
 
 /// A note anchor inside a line: `==the words==[^id]`.
@@ -251,14 +275,13 @@ pub fn install_tags(buffer: &gtk::TextBuffer) {
         .build();
     table.add(&notedef);
 
-    let title = gtk::TextTag::builder()
-        .name("title")
-        .scale(1.75)
-        .weight(700)
-        .pixels_above_lines(4)
-        .pixels_below_lines(18)
+    // Frontmatter: present, but plainly not prose.
+    let front = gtk::TextTag::builder()
+        .name("front")
+        .scale(0.85)
+        .left_margin(24)
         .build();
-    table.add(&title);
+    table.add(&front);
 
     for (name, build) in [
         ("strong", 0),
@@ -342,7 +365,7 @@ pub fn restyle_range(
         let (hidden, style) = match lines[i as usize] {
             Line::Blank => continue,
             Line::NoteDef => (0, "notedef".to_string()),
-            Line::Title => (2, "title".to_string()),
+            Line::Front => (0, "front".to_string()),
             Line::Heading { depth, marker } => (marker, format!("h{}", depth.min(MAX_DEPTH))),
             Line::Body { depth, indent } => (indent, format!("b{}", depth.min(MAX_DEPTH))),
         };
@@ -449,71 +472,147 @@ mod tests {
     use super::*;
 
     const DOC: &str = "\
-# Genesis
+---
+title: Genesis
+---
 
-- The Creation of Everything — 1:1-2:3
+# The Creation of Everything
 
-  - The Genesis of Everything — 1:1-2:3
+## The Genesis of Everything
 
-    - Part One — 1:1
+### Part One
 
-      1:1 In the beginning, God created the heavens and the earth.
+Placeholder sentence standing in for the text of a verse.
 
-    - Part Two — 1:2-2:3
+### Part Two
 
-      2 The earth was without form and void.
+Placeholder sentence for the second part.
 
-      - Day One
-- Antediluvian History — 2:4-11:26
+#### Day One
+
+# Antediluvian History
 ";
 
     #[test]
-    fn headings_and_bodies_are_classified_by_depth() {
+    fn frontmatter_is_apparatus_not_prose() {
         let c = classify(DOC);
-        assert_eq!(c[0], Line::Title, "the # title line is not a section");
-        assert_eq!(c[2], Line::Heading { depth: 0, marker: 2 });
-        assert_eq!(c[4], Line::Heading { depth: 1, marker: 4 });
-        assert_eq!(c[6], Line::Heading { depth: 2, marker: 6 });
-        assert_eq!(c[8], Line::Body { depth: 2, indent: 6 });
-        assert_eq!(c[14], Line::Heading { depth: 3, marker: 8 }, "Day One");
-        assert_eq!(c[15], Line::Heading { depth: 0, marker: 2 }, "back out to root");
+        assert_eq!(c[0], Line::Front, "the opening fence");
+        assert_eq!(c[1], Line::Front, "title:");
+        assert_eq!(c[2], Line::Front, "the closing fence");
+        assert_eq!(c[3], Line::Blank);
+    }
+
+    #[test]
+    fn hashes_give_the_depth() {
+        let c = classify(DOC);
+        assert_eq!(c[4], Line::Heading { depth: 0, marker: 2 });
+        assert_eq!(c[6], Line::Heading { depth: 1, marker: 3 });
+        assert_eq!(c[8], Line::Heading { depth: 2, marker: 4 });
+        assert_eq!(c[10], Line::Body { depth: 2, indent: 0 });
+        assert_eq!(c[16], Line::Heading { depth: 3, marker: 5 }, "Day One");
+        assert_eq!(c[18], Line::Heading { depth: 0, marker: 2 }, "back out to root");
     }
 
     #[test]
     fn body_inherits_the_depth_of_its_heading() {
-        let c = classify("- a\n\n  body\n  - b\n\n    nested body\n");
-        assert_eq!(c[2], Line::Body { depth: 0, indent: 2 });
-        assert_eq!(c[5], Line::Body { depth: 1, indent: 4 });
+        let c = classify("# a\n\nbody\n\n## b\n\nnested body\n");
+        assert_eq!(c[2], Line::Body { depth: 0, indent: 0 });
+        assert_eq!(c[6], Line::Body { depth: 1, indent: 0 });
+    }
+
+    #[test]
+    fn a_hash_without_a_space_is_body() {
+        assert_eq!(classify("# a\n\n#hashtag\n")[2], Line::Body { depth: 0, indent: 0 });
+        assert_eq!(classify("# a\n\n####### too many\n")[2], Line::Body { depth: 0, indent: 0 });
+    }
+
+    #[test]
+    fn a_list_bullet_is_body_now() {
+        // The structural meaning of `-` is gone.
+        assert_eq!(classify("# a\n\n- a list item\n")[2], Line::Body { depth: 0, indent: 0 });
     }
 
     #[test]
     fn blank_lines_are_blank() {
-        assert_eq!(classify("- a\n\n  x\n")[1], Line::Blank);
+        assert_eq!(classify("# a\n\nx\n")[1], Line::Blank);
     }
 
     #[test]
     fn section_range_covers_every_descendant() {
-        // "The Creation of Everything" at line 2 runs until the next depth-0
-        // heading on line 15.
-        assert_eq!(section_range(DOC, 2), (2, 15));
-        // "Part One" at line 6 stops at "Part Two" on line 10.
-        assert_eq!(section_range(DOC, 6), (6, 10));
+        // "The Creation of Everything" on line 4 runs to the next depth-0
+        // heading on line 18.
+        assert_eq!(section_range(DOC, 4), (4, 18));
+        // "Part One" on line 8 stops at "Part Two" on line 12.
+        assert_eq!(section_range(DOC, 8), (8, 12));
     }
 
     #[test]
     fn section_range_of_the_last_section_runs_to_the_end() {
-        let (s, e) = section_range(DOC, 15);
-        assert_eq!(s, 15);
-        assert_eq!(e, DOC.lines().count());
+        let (start, end) = section_range(DOC, 18);
+        assert_eq!(start, 18);
+        assert_eq!(end, DOC.lines().count());
     }
 
     #[test]
-    fn heading_lines_skips_the_document_title() {
-        assert_eq!(heading_lines(DOC), vec![2, 4, 6, 10, 14, 15]);
+    fn heading_lines_skips_the_frontmatter() {
+        assert_eq!(heading_lines(DOC), vec![4, 6, 8, 12, 16, 18]);
+    }
+
+    #[test]
+    fn an_unnamed_section_still_counts() {
+        assert_eq!(classify("#\n")[0], Line::Heading { depth: 0, marker: 1 });
+        assert_eq!(heading_lines("#\n"), vec![0]);
     }
 
     fn marked(line: &str, s: &Span) -> String {
         line.chars().take(s.text.1).skip(s.text.0).collect()
+    }
+
+    #[test]
+    fn an_anchor_is_found_with_its_id() {
+        let a = anchors("Paul calls himself a ==servant==[^n1] first.");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].id, "n1");
+        let line = "Paul calls himself a ==servant==[^n1] first.";
+        let chars: Vec<char> = line.chars().collect();
+        let text: String = chars[a[0].text.0..a[0].text.1].iter().collect();
+        assert_eq!(text, "servant");
+        let span: String = chars[a[0].span.0..a[0].span.1].iter().collect();
+        assert_eq!(span, "==servant==[^n1]");
+    }
+
+    #[test]
+    fn several_anchors_on_one_line() {
+        let a = anchors("==one==[^a] and ==two words==[^b] here");
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].id, "a");
+        assert_eq!(a[1].id, "b");
+    }
+
+    #[test]
+    fn highlighting_without_a_note_is_left_alone() {
+        assert!(anchors("just ==highlighted== text").is_empty());
+        assert!(anchors("==no id==[^] here").is_empty());
+        assert!(anchors("==bad==[^two words] here").is_empty());
+    }
+
+    #[test]
+    fn unterminated_markers_do_not_panic_or_match() {
+        assert!(anchors("==never closed").is_empty());
+        assert!(anchors("====").is_empty());
+        assert!(anchors("==").is_empty());
+        assert!(anchors("").is_empty());
+    }
+
+    #[test]
+    fn anchors_count_characters_not_bytes() {
+        // The em dash and Greek before the anchor are multi-byte.
+        let line = "\u{3b4}\u{3bf}ῦ\u{3bb}\u{3bf}\u{3c2} — ==servant==[^n1]";
+        let a = anchors(line);
+        assert_eq!(a.len(), 1);
+        let chars: Vec<char> = line.chars().collect();
+        let text: String = chars[a[0].text.0..a[0].text.1].iter().collect();
+        assert_eq!(text, "servant", "offsets must be char-based for TextIter");
     }
 
     #[test]
@@ -581,56 +680,4 @@ mod tests {
         assert_eq!(found[1].kind, Emphasis::Em);
     }
 
-    #[test]
-    fn an_anchor_is_found_with_its_id() {
-        let a = anchors("Paul calls himself a ==servant==[^n1] first.");
-        assert_eq!(a.len(), 1);
-        assert_eq!(a[0].id, "n1");
-        let line = "Paul calls himself a ==servant==[^n1] first.";
-        let chars: Vec<char> = line.chars().collect();
-        let text: String = chars[a[0].text.0..a[0].text.1].iter().collect();
-        assert_eq!(text, "servant");
-        let span: String = chars[a[0].span.0..a[0].span.1].iter().collect();
-        assert_eq!(span, "==servant==[^n1]");
-    }
-
-    #[test]
-    fn several_anchors_on_one_line() {
-        let a = anchors("==one==[^a] and ==two words==[^b] here");
-        assert_eq!(a.len(), 2);
-        assert_eq!(a[0].id, "a");
-        assert_eq!(a[1].id, "b");
-    }
-
-    #[test]
-    fn highlighting_without_a_note_is_left_alone() {
-        assert!(anchors("just ==highlighted== text").is_empty());
-        assert!(anchors("==no id==[^] here").is_empty());
-        assert!(anchors("==bad==[^two words] here").is_empty());
-    }
-
-    #[test]
-    fn unterminated_markers_do_not_panic_or_match() {
-        assert!(anchors("==never closed").is_empty());
-        assert!(anchors("====").is_empty());
-        assert!(anchors("==").is_empty());
-        assert!(anchors("").is_empty());
-    }
-
-    #[test]
-    fn anchors_count_characters_not_bytes() {
-        // The em dash and Greek before the anchor are multi-byte.
-        let line = "\u{3b4}\u{3bf}ῦ\u{3bb}\u{3bf}\u{3c2} — ==servant==[^n1]";
-        let a = anchors(line);
-        assert_eq!(a.len(), 1);
-        let chars: Vec<char> = line.chars().collect();
-        let text: String = chars[a[0].text.0..a[0].text.1].iter().collect();
-        assert_eq!(text, "servant", "offsets must be char-based for TextIter");
-    }
-
-    #[test]
-    fn an_unnamed_section_still_counts() {
-        assert_eq!(classify("-\n")[0], Line::Heading { depth: 0, marker: 1 });
-        assert_eq!(heading_lines("-\n"), vec![0]);
-    }
 }

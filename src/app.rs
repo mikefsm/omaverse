@@ -1258,19 +1258,14 @@ impl App {
             docview::Line::Heading { depth, .. } => Some(*depth),
             docview::Line::Body { depth, .. } => Some(*depth),
             // Splitting has no meaning inside the notes at the foot of the file.
-            docview::Line::Title => Some(0),
-            docview::Line::Blank | docview::Line::NoteDef => None,
+            docview::Line::Blank | docview::Line::NoteDef | docview::Line::Front => None,
         }) else {
             return;
         };
 
         // Splitting at the very top needs no blank lines above the new heading.
         let lead = if insert.offset() == 0 { "" } else { "\n\n" };
-        let snippet = format!(
-            "{lead}{}- \n\n{}",
-            " ".repeat(depth * 2),
-            " ".repeat((depth + 1) * 2)
-        );
+        let snippet = format!("{lead}{} \n\n", "#".repeat((depth + 1).min(6)));
         self.loading.set(true);
         let mut at = insert;
         self.buffer.insert(&mut at, &snippet);

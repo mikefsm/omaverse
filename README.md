@@ -8,108 +8,38 @@ book of scripture, and the rest of Notion is not needed for it.
 
 ## File format
 
-Outlines are ordinary Markdown. Each node is a `-` bullet — its **title**, shown
-in the outline pane — plus optional indented body text, shown in the body pane.
+Outlines are ordinary Markdown. Headings carry the structure: the number of
+hashes is the depth. Everything else is the body of the section above it.
 
 ```markdown
-# Romans
+---
+title: Jude
+---
 
-- Introduction (1:1-17)
+# Greeting and occasion
 
-  Paul stacks three self-descriptions here, each one
-  pointing away from himself.
+Placeholder opening sentence.
 
-  * servant — δοῦλος, not διάκονος
-  * apostle — sent with authority
+## Those who crept in
 
-  - The greeting
+Placeholder sentence belonging to the nested section.
 
-    Note the inversion: "called to be an apostle".
-  - Thanksgiving
-- God's wrath revealed (1:18-32)
+- an ordinary list bullet
+- another one
+
+# The charge
 ```
 
-Rules:
+Nothing here is a private convention. `-` and `*` are list bullets and mean
+nothing to omaverse; the title lives in frontmatter so all six heading levels
+stay yours; body text is flush left, so pasted text needs no re-indenting.
 
-1. A leading `# ` heading is the document title; otherwise the filename is used.
-2. `- ` at indent *N* is an outline node at depth *N* / 2.
-3. Any other line indented under a node is that node's body.
-4. **`*` and `+` bullets are prose inside a body, never structure.** One file has
-   to carry both the outline tree and prose that may itself contain bullets, so
-   `-` is structural and `*` is not. Both render identically everywhere else; the
-   distinction only means something to omaverse.
+Reading is forgiving — a missing blank line after a heading, or a jump from `#`
+straight to `###`, are both accepted. Writing is canonical: one blank line after
+every heading, and a blank line around each body.
 
-Reading is forgiving — tabs, over-indentation, and missing blank lines are all
-accepted. Writing is strict: 2 spaces per level, a blank line around each body.
-So the first save of a hand-written file produces a one-time whitespace diff.
-
-Nothing app-specific is ever written into the Markdown. Fold state and the
-current selection live in `~/.local/state/omaverse/`, which is deliberately
-outside Dropbox: it is per-machine and disposable.
-
-## Configuration
-
-`~/.config/omaverse/config.toml`, written with defaults on first run:
-
-```toml
-outline_dir = "/home/you/Dropbox/Documents/Biblical Studies/Outlines"
-```
-
-This is only where the sidebar **looks** and where the file chooser **starts** —
-not a restriction. `Ctrl+N` opens a normal save dialog, so an outline can go
-anywhere on disk. The directory is scanned recursively and immediate subfolders
-become sidebar groups, so `Outlines/New Testament/romans.md` appears under
-"New Testament".
-
-Outlines saved outside that directory would otherwise be invisible to the
-sidebar, so the last ten files opened from elsewhere appear under a **Recent**
-group. `Ctrl+O` opens any file directly.
-
-Creating a new outline never overwrites an existing file: if the name is already
-taken, that outline is opened instead.
-
-## Keys
-
-The document on the right is the whole book, continuously. The outline on the
-left is navigation: selecting a section scrolls to it, and collapsing one folds
-it away in the document too. The cursor and the outline follow each other.
-
-In the outline pane:
-
-| Key | Action |
-|---|---|
-| `Enter` | New section below, cursor lands in its heading |
-| `Tab` / `Shift+Tab` | Indent / outdent |
-| `Alt+↑` / `Alt+↓` | Move up / down |
-| `←` | Fold the section, or step out to its parent |
-| `→` | Unfold, or step in to the first child |
-| `Delete` | Delete section (confirms if it has text or children) |
-| `Ctrl+M` | Merge into the section above — drops this heading, its text joins |
-| `Ctrl+X` / `Ctrl+V` | Cut a section, paste it in below the selection |
-| drag a row | Move a section anywhere: drop on an edge for a sibling, in the middle for a child |
-| `Ctrl+Enter` / `F2` | Jump into the document |
-
-In the document:
-
-| Key | Action |
-|---|---|
-| `Ctrl+Enter` | Split the section in two at the cursor |
-| `Tab` / `Shift+Tab` | Indent / outdent the section the cursor is in |
-| `Alt+↑` / `Alt+↓` | Move that section up / down |
-| `Ctrl+Shift+A` | Annotate the selected words, or reopen the note under the cursor |
-| `Escape` | Back to the outline pane |
-
-Anywhere:
-
-| Key | Action |
-|---|---|
-| `Ctrl+N` | New outline (opens a file chooser) |
-| `Ctrl+O` | Open an outline |
-| `Ctrl+S` | Save now (autosave already runs every 800 ms) |
-| `Ctrl+\\` | Toggle the library sidebar |
-| `F7` | Corrections for the misspelled word at the cursor |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo (also `Ctrl+Y`) |
-| `Ctrl+W` / `Ctrl+Q` | Close (saves first) |
+Anything before the first heading is kept as a preamble rather than silently
+dropped, and `[^id]:` definitions at the foot of the file are notes.
 
 ## Install
 
