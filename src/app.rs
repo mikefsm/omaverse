@@ -13,6 +13,7 @@ use crate::model::{parse_path_key, path_key, Document, NodePath};
 use crate::nodeobj::NodeObject;
 use crate::parse;
 use crate::state::{self, DocState};
+use crate::theme;
 
 use gtk4 as gtk;
 use gtk4::gdk;
@@ -95,6 +96,21 @@ struct Fold {
 
 pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     load_css();
+    let themed = install_theme();
+    apply_theme(&themed);
+    // Switching omarchy theme rewrites the palette; notice it and restyle.
+    {
+        let provider = themed.clone();
+        let mut seen = theme::current_name();
+        glib::timeout_add_local(Duration::from_secs(4), move || {
+            let now = theme::current_name();
+            if now != seen {
+                seen = now;
+                apply_theme(&provider);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     let cfg = config::load();
     let wstate = state::load_window_state();
     let doc: Rc<RefCell<Document>> = Rc::new(RefCell::new(Document::default()));
@@ -508,6 +524,32 @@ fn add_action(window: &adw::ApplicationWindow, name: &str, f: impl Fn() + 'stati
     let a = gio::SimpleAction::new(name, None);
     a.connect_activate(move |_, _| f());
     window.add_action(&a);
+}
+
+/// A provider at USER priority, above both the app's own stylesheet and
+/// libadwaita's, so the palette's colour definitions win.
+fn install_theme() -> gtk::CssProvider {
+    let provider = gtk::CssProvider::new();
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_USER,
+        );
+    }
+    provider
+}
+
+fn apply_theme(provider: &gtk::CssProvider) {
+    let Some(palette) = theme::Palette::load() else { return };
+    provider.load_from_string(&palette.css());
+    // Follow the theme's own light/dark rather than the desktop's preference,
+    // which can disagree with the palette that is actually loaded.
+    adw::StyleManager::default().set_color_scheme(if palette.dark {
+        adw::ColorScheme::ForceDark
+    } else {
+        adw::ColorScheme::ForceLight
+    });
 }
 
 fn load_css() {

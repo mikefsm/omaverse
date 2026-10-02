@@ -150,6 +150,19 @@ also how you impose structure on a book you have just pasted in whole. Moving *t
 special — it is one continuous buffer, so ordinary select, cut and paste work
 across section boundaries.
 
+### Theming
+
+omaverse follows the current omarchy theme. Themes publish a palette at
+`~/.local/state/omarchy/current/theme/colors.toml`, and that is mapped onto
+libadwaita's named colours, so the window, sidebar, header bar, selection and
+accent all match whatever theme is set. Light and dark come from the palette's
+own `mode` rather than the desktop preference, which can disagree with the
+palette actually loaded. A theme switch is picked up within a few seconds, with
+no restart.
+
+Typography is deliberately left alone: the serif body and the outline keep
+their faces and sizes and simply inherit the themed foreground.
+
 ### Folding
 
 GtkTextView has no real folding. An `invisible` tag hides the glyphs but keeps

@@ -7,6 +7,7 @@ mod model;
 mod nodeobj;
 mod parse;
 mod state;
+mod theme;
 
 use gtk4::gio;
 use gtk4::prelude::*;
