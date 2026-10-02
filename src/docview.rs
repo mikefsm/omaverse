@@ -18,6 +18,9 @@ pub enum Line {
     /// Body text belonging to the section at `depth`. `indent` counts the
     /// leading spaces to hide.
     Body { depth: usize, indent: usize },
+    /// A note definition at the foot of the file. Apparatus, not prose, so it
+    /// is set apart rather than read as part of the text.
+    NoteDef,
     Blank,
 }
 
@@ -30,9 +33,21 @@ pub const MAX_DEPTH: usize = 5;
 pub fn classify(text: &str) -> Vec<Line> {
     let mut out = Vec::new();
     let mut depth = 0usize;
+    // Notes live at the foot of the file, so everything from the first
+    // definition on is apparatus.
+    let mut in_notes = false;
     for raw in text.lines() {
         let trimmed = raw.trim_start_matches(' ');
         let indent = raw.len() - trimmed.len();
+        if trimmed.starts_with("[^") && trimmed.contains("]:") && indent == 0 {
+            in_notes = true;
+            out.push(Line::NoteDef);
+            continue;
+        }
+        if in_notes {
+            out.push(if trimmed.is_empty() { Line::Blank } else { Line::NoteDef });
+            continue;
+        }
         if trimmed.is_empty() {
             out.push(Line::Blank);
         } else if let Some(rest) = trimmed.strip_prefix("- ") {
@@ -50,6 +65,60 @@ pub fn classify(text: &str) -> Vec<Line> {
         }
     }
     out
+}
+
+/// A note anchor inside a line: `==the words==[^id]`.
+/// Offsets are in characters from the start of the line, which is what
+/// GtkTextIter counts in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    /// The marked words, without the `==` on either side.
+    pub text: (usize, usize),
+    /// The whole thing including both markers and the `[^id]` reference.
+    pub span: (usize, usize),
+    pub id: String,
+}
+
+/// Find every note anchor in a line. A bare `==x==` with no `[^id]` after it is
+/// not an anchor -- it is ordinary highlighting, and left alone.
+pub fn anchors(line: &str) -> Vec<Anchor> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if chars[i] != '=' || chars[i + 1] != '=' {
+            i += 1;
+            continue;
+        }
+        let text_start = i + 2;
+        let Some(text_end) = (text_start..chars.len().saturating_sub(1))
+            .find(|&j| chars[j] == '=' && chars[j + 1] == '=')
+        else {
+            break;
+        };
+        if text_end == text_start {
+            i = text_end + 2;
+            continue;
+        }
+        // `[^id]` must follow immediately.
+        let after = text_end + 2;
+        if chars.get(after) != Some(&'[') || chars.get(after + 1) != Some(&'^') {
+            i = after;
+            continue;
+        }
+        let Some(close) = (after + 2..chars.len()).find(|&j| chars[j] == ']') else {
+            i = after;
+            continue;
+        };
+        let id: String = chars[after + 2..close].iter().collect();
+        if id.is_empty() || id.chars().any(|c| c.is_whitespace()) {
+            i = after;
+            continue;
+        }
+        found.push(Anchor { text: (text_start, text_end), span: (i, close + 1), id });
+        i = close + 1;
+    }
+    found
 }
 
 /// Create the tag table once. Tags are looked up by name afterwards.
@@ -83,6 +152,21 @@ pub fn install_tags(buffer: &gtk::TextBuffer) {
             .build();
         table.add(&body);
     }
+
+    // Note definitions: present, but clearly apparatus.
+    let notedef = gtk::TextTag::builder()
+        .name("notedef")
+        .scale(0.88)
+        .left_margin(24)
+        .build();
+    table.add(&notedef);
+
+    // Annotated words: underlined, so they read as marked without shouting.
+    let note = gtk::TextTag::builder()
+        .name("note")
+        .underline(gtk4::pango::Underline::Single)
+        .build();
+    table.add(&note);
 
     // Applied over a collapsed section's range.
     let folded = gtk::TextTag::builder().name("folded").invisible(true).build();
@@ -118,6 +202,7 @@ pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32) {
         to.forward_to_line_end();
     }
     buffer.remove_tag_by_name("marker", &from, &to);
+    buffer.remove_tag_by_name("note", &from, &to);
     for d in 0..=MAX_DEPTH {
         buffer.remove_tag_by_name(&format!("h{d}"), &from, &to);
         buffer.remove_tag_by_name(&format!("b{d}"), &from, &to);
@@ -131,6 +216,7 @@ pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32) {
         }
         let (hidden, style) = match lines[i as usize] {
             Line::Blank => continue,
+            Line::NoteDef => (0, "notedef".to_string()),
             Line::Heading { depth, marker } => (marker, format!("h{}", depth.min(MAX_DEPTH))),
             Line::Body { depth, indent } => (indent, format!("b{}", depth.min(MAX_DEPTH))),
         };
@@ -141,6 +227,19 @@ pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32) {
         }
         buffer.apply_tag_by_name("marker", &line_start, &after);
         buffer.apply_tag_by_name(&style, &line_start, &line_end);
+
+        // Underline annotated words and hide the `==` and `[^id]` around them.
+        let raw = text.lines().nth(i as usize).unwrap_or("");
+        for anchor in anchors(raw) {
+            let at = |offset: usize| {
+                let mut it = line_start;
+                it.forward_chars(offset as i32);
+                it
+            };
+            buffer.apply_tag_by_name("marker", &at(anchor.span.0), &at(anchor.text.0));
+            buffer.apply_tag_by_name("note", &at(anchor.text.0), &at(anchor.text.1));
+            buffer.apply_tag_by_name("marker", &at(anchor.text.1), &at(anchor.span.1));
+        }
     }
 }
 
@@ -255,6 +354,53 @@ mod tests {
     #[test]
     fn heading_lines_skips_the_document_title() {
         assert_eq!(heading_lines(DOC), vec![2, 4, 6, 10, 14, 15]);
+    }
+
+    #[test]
+    fn an_anchor_is_found_with_its_id() {
+        let a = anchors("Paul calls himself a ==servant==[^n1] first.");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].id, "n1");
+        let line = "Paul calls himself a ==servant==[^n1] first.";
+        let chars: Vec<char> = line.chars().collect();
+        let text: String = chars[a[0].text.0..a[0].text.1].iter().collect();
+        assert_eq!(text, "servant");
+        let span: String = chars[a[0].span.0..a[0].span.1].iter().collect();
+        assert_eq!(span, "==servant==[^n1]");
+    }
+
+    #[test]
+    fn several_anchors_on_one_line() {
+        let a = anchors("==one==[^a] and ==two words==[^b] here");
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].id, "a");
+        assert_eq!(a[1].id, "b");
+    }
+
+    #[test]
+    fn highlighting_without_a_note_is_left_alone() {
+        assert!(anchors("just ==highlighted== text").is_empty());
+        assert!(anchors("==no id==[^] here").is_empty());
+        assert!(anchors("==bad==[^two words] here").is_empty());
+    }
+
+    #[test]
+    fn unterminated_markers_do_not_panic_or_match() {
+        assert!(anchors("==never closed").is_empty());
+        assert!(anchors("====").is_empty());
+        assert!(anchors("==").is_empty());
+        assert!(anchors("").is_empty());
+    }
+
+    #[test]
+    fn anchors_count_characters_not_bytes() {
+        // The em dash and Greek before the anchor are multi-byte.
+        let line = "\u{3b4}\u{3bf}\u{1fe6}\u{3bb}\u{3bf}\u{3c2} \u{2014} ==servant==[^n1]";
+        let a = anchors(line);
+        assert_eq!(a.len(), 1);
+        let chars: Vec<char> = line.chars().collect();
+        let text: String = chars[a[0].text.0..a[0].text.1].iter().collect();
+        assert_eq!(text, "servant", "offsets must be char-based for TextIter");
     }
 
     #[test]

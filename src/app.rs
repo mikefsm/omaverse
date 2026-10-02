@@ -9,7 +9,7 @@ use crate::config::{self, Config};
 use crate::docview;
 use crate::edit::{self, Cmd};
 use crate::library;
-use crate::model::{parse_path_key, path_key, Document, NodePath};
+use crate::model::{parse_path_key, path_key, Document, NodePath, Note, NoteKind};
 use crate::nodeobj::NodeObject;
 use crate::parse;
 use crate::state::{self, DocState};
@@ -88,6 +88,10 @@ pub struct App {
     conflict: Cell<bool>,
     /// Whether the question has already been put to the user.
     conflict_asked: Cell<bool>,
+    /// True while a note popover is open. The document's key handler runs in
+    /// capture phase, so without this it intercepts Tab and Escape on their way
+    /// down and the popover never sees them.
+    note_open: Cell<bool>,
     /// A section lifted by Cut, waiting to be pasted. Kept here rather than on
     /// the system clipboard so cutting a section never clobbers what you copied.
     clipboard: RefCell<Option<crate::model::Node>>,
@@ -295,6 +299,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         disk_stamp: RefCell::new(None),
         conflict: Cell::new(false),
         conflict_asked: Cell::new(false),
+        note_open: Cell::new(false),
     });
 
     // These closures hold a strong Rc to App, which owns the widgets. The cycle
@@ -409,11 +414,30 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         kc.set_propagation_phase(gtk::PropagationPhase::Capture);
         outline_scroll.add_controller(kc);
     }
+    {
+        let a = app.clone();
+        let v = view.clone();
+        let click = gtk::GestureClick::new();
+        click.connect_released(move |_, _, x, y| {
+            let (bx, by) =
+                v.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+            let Some(iter) = v.iter_at_location(bx, by) else { return };
+            if let Some(id) = a.note_at(&iter) {
+                a.open_note(&id);
+            }
+        });
+        view.add_controller(click);
+    }
     // Ctrl+Enter and Escape move between the document and the outline.
     {
         let a = app.clone();
         let kc = gtk::EventControllerKey::new();
         kc.connect_key_pressed(move |_, key, _, state| {
+            // A note popover is a child of the text view, so these capture-phase
+            // handlers would otherwise swallow its keys before it sees them.
+            if a.note_open.get() {
+                return glib::Propagation::Proceed;
+            }
             let enter = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
             let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
@@ -426,6 +450,11 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
             }
             if key == gdk::Key::Escape {
                 a.focus_outline();
+                return glib::Propagation::Stop;
+            }
+            // Annotate the selection, or reopen the note the cursor sits in.
+            if ctrl && shift && (key == gdk::Key::a || key == gdk::Key::A) {
+                a.annotate_selection();
                 return glib::Propagation::Stop;
             }
             // Restructuring works here too. Requiring a trip to the outline pane
@@ -631,6 +660,269 @@ impl App {
 
     }
 
+    // ---- notes ------------------------------------------------------------
+
+    /// Which note, if any, the given place in the text belongs to.
+    fn note_at(&self, iter: &gtk::TextIter) -> Option<String> {
+        let text = self.text();
+        let line = text.lines().nth(iter.line() as usize)?;
+        let col = iter.line_offset() as usize;
+        docview::anchors(line)
+            .into_iter()
+            .find(|a| col >= a.text.0 && col <= a.text.1)
+            .map(|a| a.id)
+    }
+
+    /// Wrap the selected words and open an empty note on them.
+    fn annotate_selection(self: &Rc<Self>) {
+        let Some((mut start, mut end)) = self.buffer.selection_bounds() else {
+            // No selection: if the cursor sits in an existing note, open it.
+            let at = self.buffer.iter_at_mark(&self.buffer.get_insert());
+            if let Some(id) = self.note_at(&at) {
+                self.open_note(&id);
+            }
+            return;
+        };
+        if start.line() != end.line() {
+            return; // an anchor lives within one line
+        }
+        let selected = self.buffer.text(&start, &end, false).to_string();
+        if selected.trim().is_empty() || selected.contains("==") {
+            return;
+        }
+        // Keep any whitespace the selection picked up outside the markers, so
+        // the underline sits on the words and the Markdown stays well formed.
+        let words = selected.trim();
+        let lead = &selected[..selected.len() - selected.trim_start().len()];
+        let trail = &selected[selected.trim_end().len()..];
+        let id = parse::parse(&self.full_text()).fresh_note_id();
+
+        self.loading.set(true);
+        self.buffer.delete(&mut start, &mut end);
+        self.buffer.insert(&mut start, &format!("{lead}=={words}==[^{id}]{trail}"));
+        // The definition goes at the foot of the file, where notes live.
+        let mut tail = self.buffer.end_iter();
+        self.buffer.insert(&mut tail, &format!("\n[^{id}]: \n"));
+        self.loading.set(false);
+
+        self.dirty_doc.set(true);
+        self.dirty_style.set(true);
+        self.open_note(&id);
+    }
+
+    /// Show a note for reading and editing, anchored where its words are.
+    fn open_note(self: &Rc<Self>, id: &str) {
+        let doc = parse::parse(&self.full_text());
+        let note = doc
+            .note(id)
+            .cloned()
+            .unwrap_or_else(|| Note::comment(id, ""));
+        let sources = doc.sources();
+
+        let popover = gtk::Popover::new();
+        popover.set_parent(&self.view);
+        popover.set_autohide(true);
+        popover.set_pointing_to(Some(&self.anchor_rect(id)));
+
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        column.set_margin_top(10);
+        column.set_margin_bottom(10);
+        column.set_margin_start(10);
+        column.set_margin_end(10);
+        column.set_size_request(380, -1);
+
+        // Whose words these are.
+        let kinds = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        kinds.add_css_class("linked");
+        let mine = gtk::ToggleButton::with_label("My comment");
+        let quoted = gtk::ToggleButton::with_label("Quotation");
+        quoted.set_group(Some(&mine));
+        mine.set_hexpand(true);
+        quoted.set_hexpand(true);
+        match note.kind {
+            NoteKind::Comment => mine.set_active(true),
+            NoteKind::Quotation => quoted.set_active(true),
+        }
+        kinds.append(&mine);
+        kinds.append(&quoted);
+        column.append(&kinds);
+
+        let body = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::Word)
+            // Tab must move to the next field, not insert a tab: otherwise
+            // there is no way out of the note to reach the source.
+            .accepts_tab(false)
+            .top_margin(6)
+            .bottom_margin(6)
+            .left_margin(6)
+            .right_margin(6)
+            .build();
+        body.buffer().set_text(&note.text);
+        let scroller = gtk::ScrolledWindow::builder()
+            .min_content_height(90)
+            .max_content_height(260)
+            .propagate_natural_height(true)
+            .child(&body)
+            .build();
+        scroller.add_css_class("card");
+        column.append(&scroller);
+
+        // Attribution, shown only for a quotation.
+        let source = gtk::Entry::builder()
+            .placeholder_text("Source — author, work, page (leave empty for your own note)")
+            .text(note.source.clone().unwrap_or_default())
+            .build();
+        column.append(&source);
+
+        let recent = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        for known in sources.iter().take(6) {
+            let button = gtk::Button::with_label(known);
+            button.add_css_class("flat");
+            button.set_halign(gtk::Align::Start);
+            let entry = source.clone();
+            let value = known.clone();
+            button.connect_clicked(move |_| entry.set_text(&value));
+            recent.append(&button);
+        }
+        column.append(&recent);
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let remove = gtk::Button::with_label("Delete");
+        remove.add_css_class("destructive-action");
+        let done = gtk::Button::with_label("Done");
+        done.add_css_class("suggested-action");
+        done.set_hexpand(true);
+        done.set_halign(gtk::Align::End);
+        actions.append(&remove);
+        actions.append(&done);
+        column.append(&actions);
+
+        popover.set_child(Some(&column));
+
+        {
+            let me = self.clone();
+            let id = id.to_string();
+            let body = body.clone();
+            let source = source.clone();
+            let quoted = quoted.clone();
+            let popover = popover.clone();
+            done.connect_clicked(move |_| {
+                let buffer = body.buffer();
+                let (s, e) = buffer.bounds();
+                let text = buffer.text(&s, &e, false).to_string();
+                // Filling in a source says "these are not my words" just as
+                // plainly as the toggle does, and saves reaching for it.
+                let src = source.text().to_string();
+                let kind = if quoted.is_active() || !src.trim().is_empty() {
+                    NoteKind::Quotation
+                } else {
+                    NoteKind::Comment
+                };
+                me.save_note(&id, kind, &text, &src);
+                popover.popdown();
+            });
+        }
+        {
+            let me = self.clone();
+            let id = id.to_string();
+            let popover = popover.clone();
+            remove.connect_clicked(move |_| {
+                me.delete_note(&id);
+                popover.popdown();
+            });
+        }
+        {
+            let me = self.clone();
+            popover.connect_closed(move |p| {
+                me.note_open.set(false);
+                // The popover is built fresh each time it is opened.
+                p.unparent();
+            });
+        }
+        self.note_open.set(true);
+        // Enter saves, Escape abandons -- so a note can be written and filed
+        // without ever leaving the keyboard.
+        {
+            let done = done.clone();
+            let popover2 = popover.clone();
+            let keys = gtk::EventControllerKey::new();
+            keys.connect_key_pressed(move |_, key, _, state| {
+                let enter = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
+                if enter && state.contains(gdk::ModifierType::CONTROL_MASK) {
+                    done.emit_clicked();
+                    glib::Propagation::Stop
+                } else if key == gdk::Key::Escape {
+                    popover2.popdown();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            popover.add_controller(keys);
+        }
+        popover.popup();
+        // Land in the note itself: the point of opening it is to write in it.
+        let body = body.clone();
+        glib::idle_add_local_once(move || {
+            body.grab_focus();
+        });
+    }
+
+    /// Where a note's words sit on screen, for the popover to point at.
+    fn anchor_rect(&self, id: &str) -> gdk::Rectangle {
+        let text = self.text();
+        for (line_no, line) in text.lines().enumerate() {
+            let Some(a) = docview::anchors(line).into_iter().find(|a| a.id == id) else {
+                continue;
+            };
+            let Some(mut iter) = self.buffer.iter_at_line(line_no as i32) else { break };
+            iter.forward_chars(a.text.0 as i32);
+            let place = self.view.iter_location(&iter);
+            let (x, y) = self.view.buffer_to_window_coords(
+                gtk::TextWindowType::Widget,
+                place.x(),
+                place.y(),
+            );
+            return gdk::Rectangle::new(x, y, place.width().max(1), place.height());
+        }
+        let rect = self.view.visible_rect();
+        gdk::Rectangle::new(rect.width() / 2, rect.height() / 3, 1, 1)
+    }
+
+    fn save_note(&self, id: &str, kind: NoteKind, text: &str, source: &str) {
+        let mut doc = parse::parse(&self.full_text());
+        let source = (!source.trim().is_empty() && kind == NoteKind::Quotation)
+            .then(|| source.trim().to_string());
+        match doc.notes.iter_mut().find(|n| n.id == id) {
+            Some(note) => {
+                note.kind = kind;
+                note.text = text.trim().to_string();
+                note.source = source;
+            }
+            None => doc.notes.push(Note {
+                id: id.to_string(),
+                kind,
+                text: text.trim().to_string(),
+                source,
+            }),
+        }
+        self.set_text(&parse::serialize(&doc));
+        *self.doc.borrow_mut() = doc;
+        self.dirty_doc.set(true);
+    }
+
+    /// Remove a note and unwrap the words it was attached to.
+    fn delete_note(&self, id: &str) {
+        let mut doc = parse::parse(&self.full_text());
+        doc.notes.retain(|n| n.id != id);
+        let mut text = parse::serialize(&doc);
+        text = unwrap_anchor(&text, id);
+        self.set_text(&text);
+        *self.doc.borrow_mut() = parse::parse(&text);
+        self.dirty_doc.set(true);
+    }
+
     /// Break the current section in two at the cursor.
     ///
     /// Done by inserting a heading line into the text rather than by rebuilding
@@ -645,7 +937,8 @@ impl App {
         let Some(depth) = lines[..=line].iter().rev().find_map(|l| match l {
             docview::Line::Heading { depth, .. } => Some(*depth),
             docview::Line::Body { depth, .. } => Some(*depth),
-            docview::Line::Blank => None,
+            // Splitting has no meaning inside the notes at the foot of the file.
+            docview::Line::Blank | docview::Line::NoteDef => None,
         }) else {
             return;
         };
@@ -1629,6 +1922,26 @@ fn stamp_of(path: &Path) -> Option<(u64, u64)> {
         .ok()?
         .as_nanos() as u64;
     Some((nanos, meta.len()))
+}
+
+/// Replace `==words==[^id]` with just the words, leaving the text readable.
+fn unwrap_anchor(text: &str, id: &str) -> String {
+    text.lines()
+        .map(|line| {
+            match docview::anchors(line).into_iter().find(|a| a.id == id) {
+                None => line.to_string(),
+                Some(a) => {
+                    let chars: Vec<char> = line.chars().collect();
+                    let before: String = chars[..a.span.0].iter().collect();
+                    let words: String = chars[a.text.0..a.text.1].iter().collect();
+                    let after: String = chars[a.span.1..].iter().collect();
+                    format!("{before}{words}{after}")
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 fn entry_row(title: &str) -> gtk::ListBoxRow {

@@ -20,6 +20,31 @@ impl Node {
     }
 }
 
+/// Whether a note is the writer's own thought or someone else's words. Kept as
+/// a distinction the file itself records, because months later it is the one
+/// thing that cannot be reconstructed by reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteKind {
+    Comment,
+    Quotation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    /// Matches the `[^id]` marker in the text.
+    pub id: String,
+    pub kind: NoteKind,
+    pub text: String,
+    /// Author, work and page for a quotation.
+    pub source: Option<String>,
+}
+
+impl Note {
+    pub fn comment(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Note { id: id.into(), kind: NoteKind::Comment, text: text.into(), source: None }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Document {
     /// From a leading `# ` heading. Falls back to the filename in the UI.
@@ -28,6 +53,8 @@ pub struct Document {
     /// silently eat content we didn't expect.
     pub preamble: String,
     pub roots: Vec<Node>,
+    /// Footnote definitions, written at the foot of the file.
+    pub notes: Vec<Note>,
 }
 
 /// Render an index path as the stable-ish string key used in the sidecar state.
@@ -43,6 +70,29 @@ pub fn parse_path_key(key: &str) -> Option<NodePath> {
 }
 
 impl Document {
+    pub fn note(&self, id: &str) -> Option<&Note> {
+        self.notes.iter().find(|n| n.id == id)
+    }
+
+    /// Every source already used here, for offering back while typing another.
+    pub fn sources(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .notes
+            .iter()
+            .filter_map(|n| n.source.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// An id not already taken.
+    pub fn fresh_note_id(&self) -> String {
+        (1..).map(|n| format!("n{n}")).find(|id| self.note(id).is_none()).unwrap_or_default()
+    }
+
     pub fn get(&self, path: &[usize]) -> Option<&Node> {
         let (last, parents) = path.split_last()?;
         let mut vec = &self.roots;

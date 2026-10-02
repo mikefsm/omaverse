@@ -96,6 +96,7 @@ In the document:
 | `Ctrl+Enter` | Split the section in two at the cursor |
 | `Tab` / `Shift+Tab` | Indent / outdent the section the cursor is in |
 | `Alt+↑` / `Alt+↓` | Move that section up / down |
+| `Ctrl+Shift+A` | Annotate the selected words, or reopen the note under the cursor |
 | `Escape` | Back to the outline pane |
 
 Anywhere:
@@ -186,6 +187,33 @@ no restart.
 
 Typography is deliberately left alone: the serif body and the outline keep
 their faces and sizes and simply inherit the themed foreground.
+
+### Notes
+
+Select some words and press `Ctrl+Shift+A`, or click any underlined phrase. The
+note opens with the cursor already in it; `Ctrl+Enter` files it, `Escape`
+abandons it.
+
+A note is either your own comment or a quotation. Filling in the source marks it
+as a quotation, so the file records whose words they are rather than leaving you
+to remember months later. Sources already used in the same outline are offered
+back with one click, which keeps the wording consistent without a bibliography
+to maintain.
+
+In the file an annotated phrase is `==the words==[^n1]`, with the note itself
+written as an ordinary Markdown footnote at the foot of the file:
+
+```markdown
+[^n1]: The word is stronger than it looks in English.
+
+[^n2]: > An invented sentence standing in for a quoted paragraph.
+    >
+    > — A. Author, Some Commentary, p. 52
+```
+
+Both render correctly elsewhere: Obsidian shows `==` as a highlight and the
+quotation as a blockquote with its attribution. Deleting a note unwraps the
+phrase, leaving the text as it was.
 
 ### Folding
 

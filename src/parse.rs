@@ -11,7 +11,7 @@
 //! continuation would join the body onto the title line). Parsing trims blank
 //! lines from a body's edges, which is what makes the round trip stable.
 
-use crate::model::{Document, Node, NodePath};
+use crate::model::{Document, Node, NodePath, Note, NoteKind};
 
 const INDENT: usize = 2;
 
@@ -78,8 +78,130 @@ fn join_trimmed(lines: &[String]) -> String {
     }
 }
 
+/// `[^id]: rest` — a footnote definition, which is how a note is written.
+fn note_def(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("[^")?;
+    let close = rest.find("]:")?;
+    let id = &rest[..close];
+    if id.is_empty() || id.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((id.to_string(), rest[close + 2..].trim_start().to_string()))
+}
+
+/// Split the file into its outline and its notes. Notes live at the foot of the
+/// file, so everything from the first definition on belongs to them -- which is
+/// also what keeps them out of the last section's body.
+fn split_notes(src: &str) -> (String, Vec<Note>) {
+    let lines: Vec<&str> = src.lines().collect();
+    let Some(first) = lines.iter().position(|l| note_def(l).is_some()) else {
+        return (src.to_string(), Vec::new());
+    };
+    (lines[..first].join("\n"), read_notes(&lines[first..]))
+}
+
+fn read_notes(lines: &[&str]) -> Vec<Note> {
+    let mut collected: Vec<(String, Vec<String>)> = Vec::new();
+    for line in lines {
+        if let Some((id, first)) = note_def(line) {
+            collected.push((id, vec![first]));
+        } else if let Some((_, content)) = collected.last_mut() {
+            if line.trim().is_empty() {
+                content.push(String::new());
+            } else if line.starts_with(' ') || line.starts_with('\t') {
+                content.push(line.trim_start().to_string());
+            }
+        }
+    }
+    collected.into_iter().map(|(id, content)| build_note(id, content)).collect()
+}
+
+fn build_note(id: String, content: Vec<String>) -> Note {
+    let lines = trim_blank_edges(content);
+    let quoted = !lines.is_empty()
+        && lines.iter().filter(|l| !l.is_empty()).all(|l| l.starts_with('>'));
+    if !quoted {
+        return Note { id, kind: NoteKind::Comment, text: lines.join("\n"), source: None };
+    }
+    let mut body: Vec<String> = lines
+        .iter()
+        .map(|l| l.trim_start_matches('>').trim_start().to_string())
+        .collect();
+    while body.last().map(|l| l.is_empty()).unwrap_or(false) {
+        body.pop();
+    }
+    let mut source = None;
+    if let Some(last) = body.last() {
+        let attribution = last
+            .strip_prefix('—')
+            .or_else(|| last.strip_prefix("--"))
+            .or_else(|| last.strip_prefix('-'));
+        if let Some(rest) = attribution {
+            source = Some(rest.trim().to_string());
+            body.pop();
+        }
+    }
+    while body.last().map(|l| l.is_empty()).unwrap_or(false) {
+        body.pop();
+    }
+    Note { id, kind: NoteKind::Quotation, text: body.join("\n"), source }
+}
+
+fn trim_blank_edges(lines: Vec<String>) -> Vec<String> {
+    let start = lines.iter().position(|l| !l.trim().is_empty());
+    let end = lines.iter().rposition(|l| !l.trim().is_empty());
+    match (start, end) {
+        (Some(s), Some(e)) => lines[s..=e].to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+fn serialize_notes(notes: &[Note]) -> String {
+    let mut out = String::new();
+    for note in notes {
+        match note.kind {
+            NoteKind::Comment => {
+                let mut lines = note.text.lines();
+                let first = lines.next().unwrap_or("");
+                if first.is_empty() {
+                    out.push_str(&format!("[^{}]:\n", note.id));
+                } else {
+                    out.push_str(&format!("[^{}]: {}\n", note.id, first));
+                }
+                for line in lines {
+                    out.push_str("    ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            NoteKind::Quotation => {
+                let mut lines = note.text.lines();
+                out.push_str(&format!("[^{}]: > {}\n", note.id, lines.next().unwrap_or("")));
+                for line in lines {
+                    if line.is_empty() {
+                        out.push_str("    >\n");
+                    } else {
+                        out.push_str("    > ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+                if let Some(src) = note.source.as_ref().filter(|s| !s.trim().is_empty()) {
+                    out.push_str("    >\n");
+                    out.push_str(&format!("    > — {}\n", src.trim()));
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 pub fn parse(src: &str) -> Document {
+    let (body, notes) = split_notes(src);
+    let src = body.as_str();
     let mut doc = Document::default();
+    doc.notes = notes;
     let lines: Vec<String> = src.lines().map(expand_tabs).collect();
     let mut i = 0;
 
@@ -158,6 +280,15 @@ pub fn serialize(doc: &Document) -> String {
     }
     for root in &doc.roots {
         emit(root, 0, &mut out);
+    }
+    if !doc.notes.is_empty() {
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&serialize_notes(&doc.notes));
     }
     while out.ends_with("\n\n") {
         out.pop();
@@ -373,6 +504,110 @@ mod tests {
         assert_eq!(d.roots[0].body, "text of A\n\n  text that was under B");
     }
 
+    const WITH_NOTES: &str = "\
+- Introduction
+
+  Paul calls himself a ==servant==[^n1] first.
+
+[^n1]: The word is stronger than it looks in English.
+
+[^n2]: > An invented sentence standing in for a quoted paragraph.
+    >
+    > — A. Author, Some Commentary, p. 52
+";
+
+    #[test]
+    fn notes_are_read_from_the_foot_of_the_file() {
+        let d = parse(WITH_NOTES);
+        assert_eq!(d.notes.len(), 2);
+        let one = d.note("n1").unwrap();
+        assert_eq!(one.kind, NoteKind::Comment);
+        assert_eq!(one.text, "The word is stronger than it looks in English.");
+        assert!(one.source.is_none());
+    }
+
+    #[test]
+    fn a_quotation_keeps_its_source_separate_from_its_text() {
+        let d = parse(WITH_NOTES);
+        let two = d.note("n2").unwrap();
+        assert_eq!(two.kind, NoteKind::Quotation);
+        assert_eq!(two.text, "An invented sentence standing in for a quoted paragraph.");
+        assert_eq!(two.source.as_deref(), Some("A. Author, Some Commentary, p. 52"));
+    }
+
+    #[test]
+    fn notes_do_not_leak_into_the_last_section_body() {
+        let d = parse(WITH_NOTES);
+        assert_eq!(d.roots.len(), 1);
+        assert_eq!(d.roots[0].body, "Paul calls himself a ==servant==[^n1] first.");
+        assert!(!d.roots[0].body.contains("[^n1]:"), "the definition is not body text");
+    }
+
+    #[test]
+    fn notes_round_trip_byte_for_byte() {
+        assert_eq!(serialize(&parse(WITH_NOTES)), WITH_NOTES);
+    }
+
+    #[test]
+    fn a_quotation_without_a_source_round_trips() {
+        let src = "- a\n\n[^q]: > Invented placeholder sentence.\n";
+        let d = parse(src);
+        let q = d.note("q").unwrap();
+        assert_eq!(q.kind, NoteKind::Quotation);
+        assert!(q.source.is_none());
+        assert_eq!(serialize(&d), src);
+    }
+
+    #[test]
+    fn a_multi_line_quotation_keeps_its_shape() {
+        let d = parse(
+            "- a\n\n[^q]: > First invented line.\n    >\n    > Second invented line.\n    >\n    > — A. Author\n",
+        );
+        let q = d.note("q").unwrap();
+        assert_eq!(q.text, "First invented line.\n\nSecond invented line.");
+        assert_eq!(q.source.as_deref(), Some("A. Author"));
+    }
+
+    #[test]
+    fn a_multi_line_comment_keeps_its_shape() {
+        let src = "- a\n\n[^c]: First line of my own note.\n    Second line of it.\n";
+        let d = parse(src);
+        assert_eq!(d.note("c").unwrap().text, "First line of my own note.\nSecond line of it.");
+        assert_eq!(serialize(&d), src);
+    }
+
+    #[test]
+    fn a_file_with_no_notes_is_unchanged() {
+        assert_eq!(serialize(&parse(ROMANS)), ROMANS, "notes must not alter untouched files");
+        assert!(parse(ROMANS).notes.is_empty());
+    }
+
+    #[test]
+    fn sources_are_offered_once_each_and_sorted() {
+        let mut d = Document::default();
+        for (i, src) in ["B. Writer, Later Work", "A. Author, Title", "A. Author, Title"]
+            .iter()
+            .enumerate()
+        {
+            d.notes.push(Note {
+                id: format!("n{i}"),
+                kind: NoteKind::Quotation,
+                text: "x".into(),
+                source: Some(src.to_string()),
+            });
+        }
+        assert_eq!(d.sources(), ["A. Author, Title", "B. Writer, Later Work"]);
+    }
+
+    #[test]
+    fn fresh_ids_skip_the_ones_in_use() {
+        let mut d = Document::default();
+        assert_eq!(d.fresh_note_id(), "n1");
+        d.notes.push(Note::comment("n1", "x"));
+        d.notes.push(Note::comment("n2", "y"));
+        assert_eq!(d.fresh_note_id(), "n3");
+    }
+
     #[test]
     fn empty_input_produces_empty_output() {
         let d = parse("");
@@ -395,7 +630,7 @@ mod tests {
         let messy = "# Romans\n\n\
                      - Introduction (1:1-17)\n\
                      \u{20}\u{20}Paul stacks three self-descriptions here.   \n\
-                     \u{20}\u{20}* servant \u{2014} \u{3b4}\u{3bf}\u{1fe6}\u{3bb}\u{3bf}\u{3c2}\n\
+                     \u{20}\u{20}* servant — \u{3b4}\u{3bf}\u{1fe6}\u{3bb}\u{3bf}\u{3c2}\n\
                      \t- The greeting\n\
                      \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}Note the inversion.\n\
                      \u{20}\u{20}- Thanksgiving (8-15)\n\
@@ -406,7 +641,7 @@ mod tests {
             "# Romans\n\n\
              - Introduction (1:1-17)\n\n\
              \u{20}\u{20}Paul stacks three self-descriptions here.\n\
-             \u{20}\u{20}* servant \u{2014} \u{3b4}\u{3bf}\u{1fe6}\u{3bb}\u{3bf}\u{3c2}\n\n\
+             \u{20}\u{20}* servant — \u{3b4}\u{3bf}\u{1fe6}\u{3bb}\u{3bf}\u{3c2}\n\n\
              \u{20}\u{20}- The greeting\n\n\
              \u{20}\u{20}\u{20}\u{20}Note the inversion.\n\n\
              \u{20}\u{20}- Thanksgiving (8-15)\n\
