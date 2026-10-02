@@ -1,0 +1,17 @@
+[package]
+name = "omaverse"
+version = "0.1.0"
+edition = "2021"
+description = "A scripture outlining app: collapsible outline tree, Markdown on disk."
+
+[dependencies]
+gtk4 = { version = "0.11", features = ["v4_12"] }
+libadwaita = { version = "0.9", features = ["v1_5"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+toml = "1.1.6"
+
+[profile.release]
+opt-level = 2
+strip = true
