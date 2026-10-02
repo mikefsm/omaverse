@@ -1,0 +1,9 @@
+[package]
+name = "vpointer"
+version = "0.1.0"
+edition = "2021"
+description = "Drive a pointer in a Wayland compositor, for testing Omaverse. Not part of the app."
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }

@@ -35,7 +35,7 @@ const SAVE_STATE_MS: u64 = 2000;
 const WATCH_MS: u64 = 1500;
 
 const CSS: &str = "
-.oma-doc { font-family: 'Source Serif 4','Noto Serif','DejaVu Serif',serif; font-size: 12.5pt; }
+.oma-doc { font-family: 'SBL BibLit','SBL Hebrew','SBL Greek','Source Serif 4','Noto Serif',serif; font-size: 12.5pt; }
 .oma-outline { font-size: 10.5pt; }
 .oma-group { font-size: 9pt; font-weight: bold; letter-spacing: 0.04em; }
 .oma-error { color: #e01b24; }
@@ -707,7 +707,7 @@ impl App {
     /// Build a row once: label, expander, and the drag/drop controllers.
     /// Controllers go on here rather than in `bind` because rows are recycled --
     /// binding would add a fresh pair every time the row scrolled past.
-    fn setup_row(&self, item: &glib::Object) {
+    fn setup_row(self: &Rc<Self>, item: &glib::Object) {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
         let label = gtk::Label::builder()
             .xalign(0.0)
@@ -716,11 +716,39 @@ impl App {
         let expander = gtk::TreeExpander::new();
         expander.set_child(Some(&label));
         item.set_child(Some(&expander));
-        // Dragging rows used to live here. It hung the session twice: the core
-        // dump showed the main loop healthy and idle, so the drag never ended at
-        // the compositor and every input went into a grab that never closed.
-        // Removed until it can actually be driven and verified, rather than
-        // shipped on reasoning. Cmd::MoveTo and its tests are kept for its return.
+
+        let drag = gtk::DragSource::new();
+        drag.set_actions(gdk::DragAction::MOVE);
+        {
+            let ex = expander.clone();
+            drag.connect_prepare(move |_, _, _| {
+                let ptr = unsafe { ex.data::<String>("oma-path") }?;
+                let key = unsafe { ptr.as_ref() }.clone();
+                Some(gdk::ContentProvider::for_value(&key.to_value()))
+            });
+        }
+        expander.add_controller(drag);
+
+        let drop = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+        {
+            let me = self.clone();
+            let ex = expander.clone();
+            drop.connect_drop(move |_, value, _x, y| {
+                let Ok(from) = value.get::<String>() else { return false };
+                let Some(ptr) = (unsafe { ex.data::<String>("oma-path") }) else { return false };
+                let to = unsafe { ptr.as_ref() }.clone();
+                let height = ex.height() as f64;
+                let zone = if height > 0.0 { y / height } else { 0.5 };
+                // The move rebuilds the outline, destroying every row including
+                // the one whose drop controller is running right now. Doing that
+                // inside the drop hangs GTK mid-drag, so let the drag finish
+                // first and move on the next idle.
+                let me = me.clone();
+                glib::idle_add_local_once(move || me.drop_section(&from, &to, zone));
+                true
+            });
+        }
+        expander.add_controller(drop);
 
     }
 
@@ -1241,6 +1269,24 @@ impl App {
         *self.doc.borrow_mut() = parse::parse(&text);
         self.apply_folds();
         self.dirty_doc.set(true);
+    }
+
+    /// Where a drop lands: near the top or bottom edge of a row it becomes a
+    /// sibling above or below, and anywhere in the middle it becomes a child.
+    fn drop_section(&self, from: &str, to: &str, zone: f64) {
+        let (Some(from), Some(to)) = (parse_path_key(from), parse_path_key(to)) else { return };
+        if from == to {
+            return;
+        }
+        let (parent, index) = if zone < 0.25 {
+            (to[..to.len() - 1].to_vec(), *to.last().unwrap_or(&0))
+        } else if zone > 0.75 {
+            (to[..to.len() - 1].to_vec(), to.last().unwrap_or(&0) + 1)
+        } else {
+            // Clamped by the command to "last child".
+            (to.clone(), usize::MAX)
+        };
+        self.run(Cmd::MoveTo { parent, index }, Some(from));
     }
 
     /// Break the current section in two at the cursor.

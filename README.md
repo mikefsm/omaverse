@@ -41,6 +41,20 @@ every heading, and a blank line around each body.
 Anything before the first heading is kept as a preamble rather than silently
 dropped, and `[^id]:` definitions at the foot of the file are notes.
 
+## Testing against a real compositor
+
+`tools/vpointer` is a small development tool, not part of the app. It drives a
+pointer through the wlr-virtual-pointer protocol, and unlike `wlrctl` it can
+hold a button down -- press, move, release -- which is the only way to exercise
+a drag. It speaks to whatever `WAYLAND_DISPLAY` names, so pointing it at a
+nested test compositor keeps it away from the real desktop.
+
+```sh
+cargo build --release --manifest-path tools/vpointer/Cargo.toml
+WAYLAND_DISPLAY=wayland-0 tools/vpointer/target/release/vpointer \
+    --size 941x1030 move 350 141 down left move 350 57 up left
+```
+
 ## Install
 
 Needs Rust, GTK 4.12+, and libadwaita 1.5+.
@@ -91,6 +105,10 @@ implementation and their own gutter. A misspelling is just another tag, which
 this already knows how to do.
 
 ### Reorganising
+
+Sections can also be dragged in the outline: dropped on a row's edge a section
+becomes a sibling, dropped in its middle it becomes a child, and it carries its
+text and everything nested under it.
 
 Restructuring works from either side — the same keys apply to the selected row
 in the outline and to the section the cursor is in while writing, because
