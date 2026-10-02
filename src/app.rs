@@ -75,6 +75,9 @@ pub struct App {
     recent: RefCell<Vec<PathBuf>>,
     /// Text lifted out of the buffer by folding, with a mark where it belongs.
     folds: RefCell<Vec<Fold>>,
+    /// A section lifted by Cut, waiting to be pasted. Kept here rather than on
+    /// the system clipboard so cutting a section never clobbers what you copied.
+    clipboard: RefCell<Option<crate::model::Node>>,
 }
 
 /// A folded-away section. GtkTextView has no real folding -- an `invisible` tag
@@ -119,16 +122,6 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     selection.set_can_unselect(true);
 
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
-        let label = gtk::Label::builder()
-            .xalign(0.0)
-            .ellipsize(pango::EllipsizeMode::End)
-            .build();
-        let expander = gtk::TreeExpander::new();
-        expander.set_child(Some(&label));
-        item.set_child(Some(&expander));
-    });
     factory.connect_unbind(|_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
         unsafe {
@@ -269,10 +262,15 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         lib_paths: RefCell::new(Vec::new()),
         recent: RefCell::new(wstate.recent.clone()),
         folds: RefCell::new(Vec::new()),
+        clipboard: RefCell::new(None),
     });
 
     // These closures hold a strong Rc to App, which owns the widgets. The cycle
     // is never collected, but App lives for the whole process.
+    {
+        let a = app.clone();
+        factory.connect_setup(move |_, item| a.setup_row(item));
+    }
     {
         let a = app.clone();
         factory.connect_bind(move |_, item| a.bind_row(item));
@@ -355,6 +353,15 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
                 return glib::Propagation::Stop;
             } else if key == gdk::Key::Delete {
                 Cmd::Delete
+            } else if ctrl && (key == gdk::Key::m || key == gdk::Key::M) {
+                Cmd::MergeIntoPrevious
+            } else if ctrl && (key == gdk::Key::x || key == gdk::Key::X) {
+                Cmd::Cut
+            } else if ctrl && (key == gdk::Key::v || key == gdk::Key::V) {
+                match a.clipboard.borrow_mut().take() {
+                    Some(n) => Cmd::Paste(n),
+                    None => return glib::Propagation::Stop,
+                }
             } else {
                 return glib::Propagation::Proceed;
             };
@@ -370,9 +377,12 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         let kc = gtk::EventControllerKey::new();
         kc.connect_key_pressed(move |_, key, _, state| {
             let enter = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
-            if (enter && state.contains(gdk::ModifierType::CONTROL_MASK))
-                || key == gdk::Key::Escape
-            {
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let alt = state.contains(gdk::ModifierType::ALT_MASK);
+            if enter && alt {
+                a.split_at_cursor();
+                glib::Propagation::Stop
+            } else if (enter && ctrl) || key == gdk::Key::Escape {
                 a.focus_outline();
                 glib::Propagation::Stop
             } else {
@@ -498,6 +508,106 @@ impl App {
 
     // ---- rows --------------------------------------------------------------
 
+    /// Build a row once: label, expander, and the drag/drop controllers.
+    /// Controllers go on here rather than in `bind` because rows are recycled --
+    /// binding would add a fresh pair every time the row scrolled past.
+    fn setup_row(self: &Rc<Self>, item: &glib::Object) {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
+        let label = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(pango::EllipsizeMode::End)
+            .build();
+        let expander = gtk::TreeExpander::new();
+        expander.set_child(Some(&label));
+        item.set_child(Some(&expander));
+
+        let drag = gtk::DragSource::new();
+        drag.set_actions(gdk::DragAction::MOVE);
+        {
+            let ex = expander.clone();
+            drag.connect_prepare(move |_, _, _| {
+                let ptr = unsafe { ex.data::<String>("oma-path") }?;
+                let key = unsafe { ptr.as_ref() }.clone();
+                Some(gdk::ContentProvider::for_value(&key.to_value()))
+            });
+        }
+        expander.add_controller(drag);
+
+        let drop = gtk::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+        {
+            let me = self.clone();
+            let ex = expander.clone();
+            drop.connect_drop(move |_, value, _x, y| {
+                let Ok(from) = value.get::<String>() else { return false };
+                let Some(ptr) = (unsafe { ex.data::<String>("oma-path") }) else { return false };
+                let to = unsafe { ptr.as_ref() }.clone();
+                let height = ex.height() as f64;
+                let zone = if height > 0.0 { y / height } else { 0.5 };
+                me.drop_section(&from, &to, zone);
+                true
+            });
+        }
+        expander.add_controller(drop);
+    }
+
+    /// Where a drop lands: near the top or bottom edge of a row it becomes a
+    /// sibling above or below, and anywhere in the middle it becomes a child.
+    fn drop_section(&self, from: &str, to: &str, zone: f64) {
+        let (Some(from), Some(to)) = (parse_path_key(from), parse_path_key(to)) else { return };
+        if from == to {
+            return;
+        }
+        let (parent, index) = if zone < 0.25 {
+            (to[..to.len() - 1].to_vec(), *to.last().unwrap_or(&0))
+        } else if zone > 0.75 {
+            (to[..to.len() - 1].to_vec(), to.last().unwrap_or(&0) + 1)
+        } else {
+            // Clamped by the command to "last child".
+            (to.clone(), usize::MAX)
+        };
+        self.run(Cmd::MoveTo { parent, index }, Some(from));
+    }
+
+    /// Break the current section in two at the cursor.
+    ///
+    /// Done by inserting a heading line into the text rather than by rebuilding
+    /// the document from the model: the cursor is a position in the buffer, and
+    /// mapping it back onto an offset within a parsed body is both fiddly and
+    /// easy to get subtly wrong.
+    fn split_at_cursor(&self) {
+        let text = self.text();
+        let lines = docview::classify(&text);
+        let insert = self.buffer.iter_at_mark(&self.buffer.get_insert());
+        let line = (insert.line() as usize).min(lines.len().saturating_sub(1));
+        let Some(depth) = lines[..=line].iter().rev().find_map(|l| match l {
+            docview::Line::Heading { depth, .. } => Some(*depth),
+            docview::Line::Body { depth, .. } => Some(*depth),
+            docview::Line::Blank => None,
+        }) else {
+            return;
+        };
+
+        let snippet = format!(
+            "\n\n{}- \n\n{}",
+            " ".repeat(depth * 2),
+            " ".repeat((depth + 1) * 2)
+        );
+        self.loading.set(true);
+        let mut at = insert;
+        self.buffer.insert(&mut at, &snippet);
+        self.loading.set(false);
+
+        // Land on the new heading, ready to be named.
+        if let Some(mut h) = self.buffer.iter_at_line(line as i32 + 2) {
+            if !h.ends_line() {
+                h.forward_to_line_end();
+            }
+            self.buffer.place_cursor(&h);
+        }
+        self.dirty_doc.set(true);
+        self.dirty_style.set(true);
+    }
+
     fn bind_row(self: &Rc<Self>, item: &glib::Object) {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
         let Some(row) = item.item().and_downcast::<gtk::TreeListRow>() else { return };
@@ -507,6 +617,7 @@ impl App {
 
         expander.set_list_row(Some(&row));
         label.set_text(&obj.display_title());
+        unsafe { expander.set_data("oma-path", path_key(&obj.path())) };
         let binding = obj
             .bind_property("title", &label, "label")
             .transform_to(|_, t: String| {
@@ -907,6 +1018,9 @@ impl App {
         self.folds.borrow_mut().clear();
         let mut doc = parse::parse(&self.text());
         let Some(out) = edit::apply(&mut doc, at.as_deref(), cmd) else { return };
+        if let Some(node) = out.lifted {
+            *self.clipboard.borrow_mut() = Some(node);
+        }
 
         let select = match out.select {
             Some(p) => p,

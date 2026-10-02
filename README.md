@@ -84,6 +84,9 @@ In the outline pane:
 | `←` | Fold the section, or step out to its parent |
 | `→` | Unfold, or step in to the first child |
 | `Delete` | Delete section (confirms if it has text or children) |
+| `Ctrl+M` | Merge into the section above — drops this heading, its text joins |
+| `Ctrl+X` / `Ctrl+V` | Cut a section, paste it in below the selection |
+| drag a row | Move a section anywhere: drop on an edge for a sibling, in the middle for a child |
 | `Ctrl+Enter` / `F2` | Jump into the document |
 
 In the document:
@@ -91,6 +94,7 @@ In the document:
 | Key | Action |
 |---|---|
 | `Ctrl+Enter` / `Escape` | Back to the outline pane |
+| `Alt+Enter` | Split the section in two at the cursor |
 
 Anywhere:
 
@@ -125,6 +129,19 @@ the file is read or saved.
 Not yet: fold triangles in the document itself (folding is driven from the
 outline pane), live-rendered bold/italic inside body text, installer /
 `.desktop` entry / external-change detection / spellcheck.
+
+### Reorganising
+
+The outline pane is where sections get moved: `Tab`/`Shift+Tab` to change depth,
+`Alt+↑`/`Alt+↓` between siblings, and dragging for anything further. Cut and paste
+carry a whole section — heading, text and everything nested under it — in an
+internal clipboard, so cutting a section never clobbers what you copied.
+
+`Ctrl+M` is the common case of "this actually belongs with the one above": it
+drops the heading and its text joins the section above, adopting its children.
+`Alt+Enter` is the inverse. Moving *text* rather than sections needs nothing
+special — it is one continuous buffer, so ordinary select, cut and paste work
+across section boundaries.
 
 ### Folding
 
