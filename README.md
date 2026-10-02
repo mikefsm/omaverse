@@ -150,6 +150,18 @@ also how you impose structure on a book you have just pasted in whole. Moving *t
 special — it is one continuous buffer, so ordinary select, cut and paste work
 across section boundaries.
 
+### Files changing underneath you
+
+These outlines live in Dropbox, so another machine can rewrite one while it is
+open here. Saving therefore refuses to write whenever the file on disk is not
+the one omaverse last left — that check lives in the save itself, not in a
+timer, because autosave runs more often than any watch interval and a timer
+always loses the race.
+
+When that happens you are asked which version wins, and the one you set aside is
+written to `~/.local/state/omaverse/conflicts/` rather than discarded. If the
+file changes while you have no unsaved edits, it just reloads.
+
 ### Theming
 
 omaverse follows the current omarchy theme. Themes publish a palette at

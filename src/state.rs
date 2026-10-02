@@ -104,6 +104,21 @@ pub fn save_doc_state(doc: &Path, st: &DocState) {
     write_json(&state_dir().join("docs").join(doc_key(doc)), st);
 }
 
+/// Where a side of a conflict is parked before the other one wins. Deliberately
+/// outside the outline directory: it is a safety net, not a document, and should
+/// not appear in the library or sync anywhere.
+pub fn conflict_backup(doc: &Path, side: &str) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stem = doc
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "outline".into());
+    state_dir().join("conflicts").join(format!("{stem}-{side}-{stamp}.md"))
+}
+
 pub fn load_window_state() -> WindowState {
     read_json(&state_dir().join("window.json"))
 }

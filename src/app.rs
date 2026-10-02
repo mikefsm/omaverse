@@ -32,6 +32,7 @@ use std::time::Duration;
 const STYLE_MS: u64 = 200;
 const SAVE_DOC_MS: u64 = 800;
 const SAVE_STATE_MS: u64 = 2000;
+const WATCH_MS: u64 = 1500;
 
 const CSS: &str = "
 .oma-doc { font-family: 'Source Serif 4','Noto Serif','DejaVu Serif',serif; font-size: 12.5pt; }
@@ -79,6 +80,14 @@ pub struct App {
     recent: RefCell<Vec<PathBuf>>,
     /// Text lifted out of the buffer by folding, with a mark where it belongs.
     folds: RefCell<Vec<Fold>>,
+    /// Size and modification time of the file as omaverse last left it, so a
+    /// change made by anything else can be told apart from its own writes.
+    disk_stamp: RefCell<Option<(u64, u64)>>,
+    /// True while a conflict is unresolved. Autosave stops, so the file on disk
+    /// is never overwritten while the question is still open.
+    conflict: Cell<bool>,
+    /// Whether the question has already been put to the user.
+    conflict_asked: Cell<bool>,
     /// A section lifted by Cut, waiting to be pasted. Kept here rather than on
     /// the system clipboard so cutting a section never clobbers what you copied.
     clipboard: RefCell<Option<crate::model::Node>>,
@@ -283,6 +292,9 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         recent: RefCell::new(wstate.recent.clone()),
         folds: RefCell::new(Vec::new()),
         clipboard: RefCell::new(None),
+        disk_stamp: RefCell::new(None),
+        conflict: Cell::new(false),
+        conflict_asked: Cell::new(false),
     });
 
     // These closures hold a strong Rc to App, which owns the widgets. The cycle
@@ -485,11 +497,18 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         glib::timeout_add_local(Duration::from_millis(SAVE_DOC_MS), move || {
-            if a.dirty_doc.get() {
+            if a.dirty_doc.get() && !a.conflict.get() {
                 a.dirty_doc.set(false);
                 a.refresh_structure();
                 a.save_doc();
             }
+            glib::ControlFlow::Continue
+        });
+    }
+    {
+        let a = app.clone();
+        glib::timeout_add_local(Duration::from_millis(WATCH_MS), move || {
+            a.check_disk();
             glib::ControlFlow::Continue
         });
     }
@@ -1281,6 +1300,9 @@ impl App {
         self.rebuild_tree();
         self.apply_folds();
 
+        self.record_stamp(path);
+        self.conflict.set(false);
+        self.conflict_asked.set(false);
         state::push_recent(&mut self.recent.borrow_mut(), path);
         self.save_window_state();
 
@@ -1468,18 +1490,140 @@ impl App {
         }
     }
 
+    // ---- watching the file ------------------------------------------------
+
+    /// Notice a write by anything other than omaverse.
+    fn check_disk(self: &Rc<Self>) {
+        if self.conflict.get() {
+            // save_doc already refused to write. Put the question to the user,
+            // once.
+            if !self.conflict_asked.replace(true) {
+                if let Some(path) = self.path.borrow().clone() {
+                    self.show_conflict(&path);
+                }
+            }
+            return;
+        }
+        let Some(path) = self.path.borrow().clone() else { return };
+        // A missing file is left alone: Dropbox and editors both replace files
+        // by rename, so a brief gap is normal and not something to react to.
+        let Some(now) = stamp_of(&path) else { return };
+        let known = *self.disk_stamp.borrow();
+        match known {
+            None => *self.disk_stamp.borrow_mut() = Some(now),
+            Some(known) if known == now => {}
+            Some(_) => {
+                if self.dirty_doc.get() {
+                    // Unsaved edits here and a new version there.
+                    self.conflict.set(true);
+                    self.conflict_asked.set(true);
+                    self.show_conflict(&path);
+                } else {
+                    self.reload_from_disk(&path);
+                }
+            }
+        }
+    }
+
+    fn record_stamp(&self, path: &Path) {
+        *self.disk_stamp.borrow_mut() = stamp_of(path);
+    }
+
+    fn reload_from_disk(&self, path: &Path) {
+        let Ok(src) = std::fs::read_to_string(path) else { return };
+        let offset = self.buffer.iter_at_mark(&self.buffer.get_insert()).offset();
+        // Marks into the old content are about to be invalid.
+        self.folds.borrow_mut().clear();
+        self.set_text(&src);
+        *self.doc.borrow_mut() = parse::parse(&src);
+        self.prune_collapsed();
+        self.rebuild_tree();
+        self.apply_folds();
+        let mut at = self.buffer.iter_at_offset(offset.min(self.buffer.char_count()));
+        self.buffer.place_cursor(&at);
+        self.view.scroll_to_iter(&mut at, 0.0, true, 0.0, 0.3);
+        self.record_stamp(path);
+        self.wtitle
+            .set_subtitle(&format!("{} — reloaded, it changed on disk", self.pretty(path)));
+    }
+
+    fn show_conflict(self: &Rc<Self>, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "This outline".into());
+        let dlg = adw::AlertDialog::new(
+            Some(&format!("{name} changed on disk")),
+            Some(
+                "Something else wrote this file while you were editing it, most likely \
+Dropbox syncing a change from another machine. Whichever version you set aside is \
+kept, so neither is lost.",
+            ),
+        );
+        dlg.add_response("theirs", "Load theirs");
+        dlg.add_response("mine", "Keep mine");
+        dlg.set_response_appearance("mine", adw::ResponseAppearance::Suggested);
+        dlg.set_default_response(Some("mine"));
+        dlg.set_close_response("mine");
+        let me = self.clone();
+        let path = path.to_path_buf();
+        dlg.connect_response(None, move |_, resp| me.resolve_conflict(&path, resp));
+        dlg.present(Some(&self.window));
+    }
+
+    fn resolve_conflict(&self, path: &Path, choice: &str) {
+        self.conflict_asked.set(false);
+        self.wtitle.remove_css_class("oma-error");
+        if choice == "theirs" {
+            let kept = state::conflict_backup(path, "mine");
+            let _ = crate::atomic_write(&kept, self.full_text().as_bytes());
+            self.conflict.set(false);
+            self.dirty_doc.set(false);
+            self.reload_from_disk(path);
+            self.wtitle
+                .set_subtitle(&format!("Loaded from disk — yours kept at {}", self.pretty(&kept)));
+        } else {
+            if let Ok(theirs) = std::fs::read(path) {
+                let kept = state::conflict_backup(path, "theirs");
+                let _ = crate::atomic_write(&kept, &theirs);
+                self.conflict.set(false);
+                self.save_doc();
+                self.dirty_doc.set(false);
+                self.wtitle
+                    .set_subtitle(&format!("Kept yours — theirs at {}", self.pretty(&kept)));
+                return;
+            }
+            self.conflict.set(false);
+            self.save_doc();
+            self.dirty_doc.set(false);
+        }
+    }
+
     // ---- saving ------------------------------------------------------------
 
     /// Save what is in the buffer, verbatim. Typing is never reformatted
     /// underneath the cursor; only structural commands rewrite the text.
     fn save_doc(&self) {
         let Some(path) = self.path.borrow().clone() else { return };
+        // Refuse to write over something written by anything else. This has to
+        // live here rather than in the watch timer: autosave runs more often
+        // than any sensible watch interval, so a timer always loses the race.
+        if let (Some(now), Some(known)) = (stamp_of(&path), *self.disk_stamp.borrow()) {
+            if now != known {
+                self.conflict.set(true);
+                self.wtitle
+                    .set_subtitle(&format!("{} — changed on disk, not saved", self.pretty(&path)));
+                self.wtitle.add_css_class("oma-error");
+                return;
+            }
+        }
         let mut text = self.full_text();
         if !text.ends_with('\n') && !text.is_empty() {
             text.push('\n');
         }
         match crate::atomic_write(&path, text.as_bytes()) {
             Ok(()) => {
+                self.record_stamp(&path);
                 self.wtitle.set_subtitle(&self.pretty(&path));
                 self.wtitle.remove_css_class("oma-error");
             }
@@ -1508,6 +1652,19 @@ impl App {
             recent: self.recent.borrow().clone(),
         });
     }
+}
+
+/// Modification time in nanoseconds plus length: enough to catch a rewrite that
+/// happens within the same second, which Dropbox routinely does.
+fn stamp_of(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let nanos = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some((nanos, meta.len()))
 }
 
 fn entry_row(title: &str) -> gtk::ListBoxRow {
