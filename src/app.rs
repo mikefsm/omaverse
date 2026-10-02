@@ -37,7 +37,7 @@ const WATCH_MS: u64 = 1500;
 const CSS: &str = "
 .oma-doc { font-family: 'Source Serif 4','Noto Serif','DejaVu Serif',serif; font-size: 12.5pt; }
 .oma-outline { font-size: 10.5pt; }
-.oma-group { font-size: 9pt; font-weight: bold; opacity: 0.55; }
+.oma-group { font-size: 9pt; font-weight: bold; letter-spacing: 0.04em; }
 .oma-error { color: #e01b24; }
 ";
 
@@ -334,6 +334,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         buffer.connect_cursor_position_notify(move |_| {
             if !a.loading.get() {
                 a.dirty_cursor.set(true);
+                a.dirty_style.set(true);
             }
         });
     }
@@ -1203,6 +1204,11 @@ impl App {
 
     // ---- document rendering ------------------------------------------------
 
+    /// The line the cursor is on; emphasis markers stay visible there.
+    fn cursor_line(&self) -> i32 {
+        self.buffer.iter_at_mark(&self.buffer.get_insert()).line()
+    }
+
     /// Lines on screen, plus enough either side to cover a small scroll.
     fn visible_lines(&self) -> (i32, i32) {
         let rect = self.view.visible_rect();
@@ -1215,7 +1221,7 @@ impl App {
     fn restyle(&self) {
         self.loading.set(true);
         let (first, last) = self.visible_lines();
-        docview::restyle_range(&self.buffer, first, last);
+        docview::restyle_range(&self.buffer, first, last, self.cursor_line());
         self.loading.set(false);
         self.apply_folds();
     }
@@ -1302,7 +1308,7 @@ impl App {
         self.buffer.end_irreversible_action();
         self.loading.set(false);
         let (first, last) = self.visible_lines();
-        docview::restyle_range(&self.buffer, first, last);
+        docview::restyle_range(&self.buffer, first, last, self.cursor_line());
         self.queue_gutter();
     }
 

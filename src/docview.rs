@@ -121,6 +121,87 @@ pub fn anchors(line: &str) -> Vec<Anchor> {
     found
 }
 
+/// Inline emphasis found in a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emphasis {
+    Strong,
+    Em,
+    Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub kind: Emphasis,
+    /// The emphasised words, without their markers.
+    pub text: (usize, usize),
+    /// Everything including both markers.
+    pub whole: (usize, usize),
+}
+
+/// Find `**bold**`, `*italic*`, `_italic_` and `` `code` `` in a line.
+///
+/// A `*` opening a prose list is left alone, and so is anything inside a note
+/// anchor's `[^id]`, so marking up text cannot be confused with structure.
+pub fn emphasis(line: &str) -> Vec<Span> {
+    let chars: Vec<char> = line.chars().collect();
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    // A prose list marker: `* ` at the start of the line's content.
+    let list_marker = chars.get(indent) == Some(&'*') && chars.get(indent + 1) == Some(&' ');
+
+    // Ranges occupied by note anchors, which emphasis must not reach into.
+    let anchored: Vec<(usize, usize)> = anchors(line).iter().map(|a| (a.text.1, a.whole_end())).collect();
+    let protected = |i: usize| anchored.iter().any(|&(s, e)| i >= s && i < e);
+
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if protected(i) {
+            i += 1;
+            continue;
+        }
+        let (kind, marker) = match chars[i] {
+            '`' => (Emphasis::Code, 1),
+            '*' if chars.get(i + 1) == Some(&'*') => (Emphasis::Strong, 2),
+            '*' if !(list_marker && i == indent) => (Emphasis::Em, 1),
+            '_' => (Emphasis::Em, 1),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let open = chars[i];
+        let start = i + marker;
+        let mut j = start;
+        let close = loop {
+            if j + marker > chars.len() {
+                break None;
+            }
+            if chars[j] == open && (marker == 1 || chars.get(j + 1) == Some(&open)) {
+                break Some(j);
+            }
+            j += 1;
+        };
+        match close {
+            Some(end) if end > start && !protected(end) => {
+                found.push(Span {
+                    kind,
+                    text: (start, end),
+                    whole: (i, end + marker),
+                });
+                i = end + marker;
+            }
+            _ => i += marker,
+        }
+    }
+    found
+}
+
+impl Anchor {
+    fn whole_end(&self) -> usize {
+        self.span.1
+    }
+}
+
 /// Create the tag table once. Tags are looked up by name afterwards.
 pub fn install_tags(buffer: &gtk::TextBuffer) {
     let table = buffer.tag_table();
@@ -161,6 +242,26 @@ pub fn install_tags(buffer: &gtk::TextBuffer) {
         .build();
     table.add(&notedef);
 
+    for (name, build) in [
+        ("strong", 0),
+        ("em", 1),
+        ("code", 2),
+    ] {
+        let tag = match build {
+            0 => gtk::TextTag::builder().name(name).weight(700).build(),
+            1 => gtk::TextTag::builder()
+                .name(name)
+                .style(gtk4::pango::Style::Italic)
+                .build(),
+            _ => gtk::TextTag::builder()
+                .name(name)
+                .family("monospace")
+                .scale(0.94)
+                .build(),
+        };
+        table.add(&tag);
+    }
+
     // Annotated words: underlined, so they read as marked without shouting.
     let note = gtk::TextTag::builder()
         .name("note")
@@ -184,7 +285,7 @@ fn indent_px(depth: usize) -> i32 {
 /// buffer on every keystroke saturates the CPU on a book-length outline.
 /// Classification still runs over the whole text, because a line's depth
 /// depends on the nearest heading above it.
-pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32) {
+pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32, cursor_line: i32) {
     let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
     let lines = classify(&text);
     if lines.is_empty() {
@@ -240,12 +341,33 @@ pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32) {
             buffer.apply_tag_by_name("note", &at(anchor.text.0), &at(anchor.text.1));
             buffer.apply_tag_by_name("marker", &at(anchor.text.1), &at(anchor.span.1));
         }
+
+        // Emphasis renders as you write. The markers stay visible on the line
+        // the cursor is on, so what you are editing is never hidden from you.
+        let reveal = i == cursor_line;
+        for span in emphasis(raw) {
+            let at = |offset: usize| {
+                let mut it = line_start;
+                it.forward_chars(offset as i32);
+                it
+            };
+            let name = match span.kind {
+                Emphasis::Strong => "strong",
+                Emphasis::Em => "em",
+                Emphasis::Code => "code",
+            };
+            buffer.apply_tag_by_name(name, &at(span.text.0), &at(span.text.1));
+            if !reveal {
+                buffer.apply_tag_by_name("marker", &at(span.whole.0), &at(span.text.0));
+                buffer.apply_tag_by_name("marker", &at(span.text.1), &at(span.whole.1));
+            }
+        }
     }
 }
 
 /// Restyle everything. Only for small buffers or a fresh document.
 pub fn restyle(buffer: &gtk::TextBuffer) {
-    restyle_range(buffer, 0, i32::MAX);
+    restyle_range(buffer, 0, i32::MAX, -1);
 }
 
 /// The line a section starts on, and the line after everything it contains.
@@ -356,6 +478,75 @@ mod tests {
         assert_eq!(heading_lines(DOC), vec![2, 4, 6, 10, 14, 15]);
     }
 
+    fn marked(line: &str, s: &Span) -> String {
+        line.chars().take(s.text.1).skip(s.text.0).collect()
+    }
+
+    #[test]
+    fn bold_italic_and_code_are_found() {
+        let line = "Paul stacks **three** self-descriptions, *each* one `pointing` away.";
+        let found = emphasis(line);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].kind, Emphasis::Strong);
+        assert_eq!(marked(line, &found[0]), "three");
+        assert_eq!(found[1].kind, Emphasis::Em);
+        assert_eq!(marked(line, &found[1]), "each");
+        assert_eq!(found[2].kind, Emphasis::Code);
+        assert_eq!(marked(line, &found[2]), "pointing");
+    }
+
+    #[test]
+    fn underscores_italicise_too() {
+        let line = "the word _doulos_ is stronger";
+        let found = emphasis(line);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, Emphasis::Em);
+        assert_eq!(marked(line, &found[0]), "doulos");
+    }
+
+    #[test]
+    fn a_prose_list_marker_is_not_italic() {
+        // `*` opens a list in a body; it must not pair with a later asterisk.
+        assert!(emphasis("  * servant, not deacon").is_empty());
+        // but emphasis inside such a line still works
+        let line = "  * servant, **not** deacon";
+        let found = emphasis(line);
+        assert_eq!(found.len(), 1);
+        assert_eq!(marked(line, &found[0]), "not");
+    }
+
+    #[test]
+    fn a_note_anchor_is_left_intact() {
+        // The `[^id]` must not be read as emphasis, whatever is in the id.
+        let line = "a ==servant==[^n_1] first";
+        assert!(emphasis(line).is_empty(), "the anchor id is off limits");
+    }
+
+    #[test]
+    fn unpaired_markers_are_ignored() {
+        assert!(emphasis("2 + 2 * 2 is not italic").is_empty());
+        assert!(emphasis("a lone ` backtick").is_empty());
+        assert!(emphasis("**").is_empty());
+        assert!(emphasis("****").is_empty());
+        assert!(emphasis("").is_empty());
+    }
+
+    #[test]
+    fn emphasis_offsets_count_characters() {
+        let line = "\u{3b4}\u{3bf}ῦ\u{3bb}\u{3bf}\u{3c2} — **servant**";
+        let found = emphasis(line);
+        assert_eq!(found.len(), 1);
+        assert_eq!(marked(line, &found[0]), "servant");
+    }
+
+    #[test]
+    fn bold_wins_over_italic_at_a_double_marker() {
+        let line = "**both** and *one*";
+        let found = emphasis(line);
+        assert_eq!(found[0].kind, Emphasis::Strong);
+        assert_eq!(found[1].kind, Emphasis::Em);
+    }
+
     #[test]
     fn an_anchor_is_found_with_its_id() {
         let a = anchors("Paul calls himself a ==servant==[^n1] first.");
@@ -395,7 +586,7 @@ mod tests {
     #[test]
     fn anchors_count_characters_not_bytes() {
         // The em dash and Greek before the anchor are multi-byte.
-        let line = "\u{3b4}\u{3bf}\u{1fe6}\u{3bb}\u{3bf}\u{3c2} \u{2014} ==servant==[^n1]";
+        let line = "\u{3b4}\u{3bf}ῦ\u{3bb}\u{3bf}\u{3c2} — ==servant==[^n1]";
         let a = anchors(line);
         assert_eq!(a.len(), 1);
         let chars: Vec<char> = line.chars().collect();

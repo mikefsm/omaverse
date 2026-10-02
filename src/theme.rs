@@ -61,7 +61,7 @@ impl Palette {
     pub fn css(&self) -> String {
         let bg = self.get("background", if self.dark { "#1d1d20" } else { "#fafafa" });
         let fg = self.get("foreground", if self.dark { "#ffffff" } else { "#000000" });
-        let dim = self.get("dark_foreground", fg);
+        let _dim = self.get("dark_foreground", fg);
         let chrome = self.get("dark_background", bg);
         let deep = self.get("darker_background", chrome);
         let raised = self.get("lighter_background", bg);
@@ -102,8 +102,10 @@ impl Palette {
 @define-color theme_selected_bg_color {accent};
 @define-color theme_selected_fg_color {bg};
 
-/* Selected rows read as the accent; the dim colour carries group headings. */
-.oma-group {{ color: {dim}; }}
+/* Group headings are secondary, not faint: the palette's dim foreground can sit
+   very close to the sidebar's own background, and dimming it further made them
+   unreadable. */
+.oma-group {{ color: {fg}; opacity: 0.72; }}
 .oma-error {{ color: {red}; }}
 textview text selection {{ background-color: {selection}; color: {fg}; }}
 listview > row:selected,

@@ -142,7 +142,12 @@ margin beside its heading, and folding one hides its contents in place. Nothing
 is lost: the lifted text is parked with a mark and spliced back whenever the file
 is read or saved. The outline pane folds the same sections with the same state.
 
-Not yet: live-rendered bold and italic inside body text, and spellcheck.
+Bold, italic and inline code render as you write: `**bold**`, `*italic*`,
+`_italic_` and `` `code` ``. The markers stay visible on the line the cursor is
+on, so what you are editing is never hidden from you, and a `*` opening a prose
+list is left alone rather than read as emphasis.
+
+Not yet: spellcheck.
 
 ### Reorganising
 
