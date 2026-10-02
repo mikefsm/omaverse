@@ -72,7 +72,7 @@ pub struct App {
     recent: RefCell<Vec<PathBuf>>,
 }
 
-pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
+pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     load_css();
     let cfg = config::load();
     let wstate = state::load_window_state();
@@ -352,6 +352,12 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
                 Cmd::MoveUp
             } else if key == gdk::Key::Down && alt {
                 Cmd::MoveDown
+            } else if key == gdk::Key::Left {
+                a.collapse_or_parent();
+                return glib::Propagation::Stop;
+            } else if key == gdk::Key::Right {
+                a.expand_or_child();
+                return glib::Propagation::Stop;
             } else if key == gdk::Key::Delete {
                 Cmd::Delete
             } else if key == gdk::Key::F2 {
@@ -363,7 +369,12 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
             a.apply_cmd(cmd);
             glib::Propagation::Stop
         });
-        list.add_controller(kc);
+        // Capture phase, on the scroller rather than the list: GtkListView
+        // consumes Return for row activation and GtkWindow claims Tab for focus
+        // movement, both before a bubble-phase controller on the list would see
+        // them. Keys this handler does not claim still fall through.
+        kc.set_propagation_phase(gtk::PropagationPhase::Capture);
+        outline_scroll.add_controller(kc);
     }
     // Ctrl+Enter from the body goes back to the title.
     {
@@ -378,7 +389,28 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
                 glib::Propagation::Proceed
             }
         });
-        body_view.add_controller(kc);
+        // Same reasoning: GtkTextView would insert a newline for Ctrl+Enter.
+        kc.set_propagation_phase(gtk::PropagationPhase::Capture);
+        body_scroll.add_controller(kc);
+    }
+    // Escape goes back to the outline pane. Without it there is no way out of
+    // the title or body by keyboard once you are in them.
+    for widget in [
+        title_entry.clone().upcast::<gtk::Widget>(),
+        body_scroll.clone().upcast::<gtk::Widget>(),
+    ] {
+        let a = app.clone();
+        let kc = gtk::EventControllerKey::new();
+        kc.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                a.focus_outline();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        kc.set_propagation_phase(gtk::PropagationPhase::Capture);
+        widget.add_controller(kc);
     }
 
     // ---- actions -----------------------------------------------------------
@@ -402,10 +434,16 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
         let a = app.clone();
         move || a.open_dialog()
     });
+    add_action(&window, "close", {
+        let w = window.clone();
+        // close() emits close-request, so the usual save-and-persist runs.
+        move || w.close()
+    });
     gapp.set_accels_for_action("win.save", &["<Primary>s"]);
     gapp.set_accels_for_action("win.toggle-sidebar", &["<Primary>backslash"]);
     gapp.set_accels_for_action("win.new-outline", &["<Primary>n"]);
     gapp.set_accels_for_action("win.open-outline", &["<Primary>o"]);
+    gapp.set_accels_for_action("win.close", &["<Primary>w", "<Primary>q"]);
 
     // Periodic flushers. Polling a dirty flag avoids the cancellation bugs that
     // come with rescheduling a timer on every keystroke.
@@ -445,7 +483,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
     if let Some(p) = cli.or(wstate.last_file).filter(|p| p.exists()) {
         app.open(&p);
     }
-    window.present();
+    app
 }
 
 fn add_action(window: &adw::ApplicationWindow, name: &str, f: impl Fn() + 'static) {
@@ -467,6 +505,17 @@ fn load_css() {
 }
 
 impl App {
+    pub fn present(&self) {
+        self.window.present();
+        // A widget cannot take focus before it is mapped, and the initial
+        // document is opened while the window is still being built, so the grab
+        // in `select_path` is too early on startup. Retry once we are idle.
+        let list = self.list.clone();
+        glib::idle_add_local_once(move || {
+            list.grab_focus();
+        });
+    }
+
     // ---- rows --------------------------------------------------------------
 
     fn bind_row(self: &Rc<Self>, item: &glib::Object) {
@@ -499,18 +548,37 @@ impl App {
         }
     }
 
-    fn on_row_expanded(&self, row: &gtk::TreeListRow) {
-        let Some(obj) = row.item().and_downcast::<NodeObject>() else { return };
-        let key = path_key(&obj.path());
-        {
-            let mut st = self.dstate.borrow_mut();
+    /// A row toggling only marks state dirty. What is actually collapsed is read
+    /// off the tree in `capture_collapsed` -- see there for why.
+    fn on_row_expanded(&self, _row: &gtk::TreeListRow) {
+        if !self.loading.get() {
+            self.dirty_state.set(true);
+        }
+    }
+
+    /// Read fold state from the rows that currently exist.
+    ///
+    /// Trusting each row's `notify::expanded` does not work: collapsing a node
+    /// destroys its child rows, and they report themselves not-expanded on the
+    /// way out, so a parent's collapse was recorded as if the user had closed
+    /// every descendant too. Walking the live rows avoids that entirely --
+    /// descendants of a collapsed node have no rows, so their previously stored
+    /// state is left untouched rather than overwritten.
+    fn capture_collapsed(&self) {
+        let mut st = self.dstate.borrow_mut();
+        for i in 0..self.tree.n_items() {
+            let Some(row) = self.tree.row(i) else { continue };
+            if !row.is_expandable() {
+                continue;
+            }
+            let Some(obj) = row.item().and_downcast::<NodeObject>() else { continue };
+            let key = path_key(&obj.path());
             if row.is_expanded() {
                 st.collapsed.remove(&key);
             } else {
                 st.collapsed.insert(key);
             }
         }
-        self.dirty_state.set(true);
     }
 
     // ---- editing -----------------------------------------------------------
@@ -642,6 +710,61 @@ impl App {
 
     fn focus_body(&self) {
         self.body_view.grab_focus();
+    }
+
+    fn focus_outline(&self) {
+        self.list.grab_focus();
+    }
+
+    /// The selected row, if any.
+    fn selected_row(&self) -> Option<gtk::TreeListRow> {
+        let i = self.selection.selected();
+        if i == gtk::INVALID_LIST_POSITION {
+            return None;
+        }
+        self.tree.row(i)
+    }
+
+    /// Set the selected row's expansion. Returns false when it was already
+    /// there, or the node has no children. GTK gives TreeExpander no dependable
+    /// Left/Right bindings of its own, so this is driven by hand.
+    fn set_expanded(&self, expand: bool) -> bool {
+        match self.selected_row() {
+            Some(row) if row.is_expandable() && row.is_expanded() != expand => {
+                row.set_expanded(expand);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Left: close the node, or step out to its parent if already closed.
+    fn collapse_or_parent(&self) {
+        if self.set_expanded(false) {
+            return;
+        }
+        let parent = self.selected.borrow().clone().filter(|p| p.len() > 1);
+        if let Some(p) = parent {
+            self.select_path(&p[..p.len() - 1]);
+        }
+    }
+
+    /// Right: open the node, or step in to its first child if already open.
+    fn expand_or_child(&self) {
+        if self.set_expanded(true) {
+            return;
+        }
+        let child = self.selected.borrow().clone().and_then(|p| {
+            let has = self.doc.borrow().get(&p).map(|n| !n.children.is_empty()).unwrap_or(false);
+            has.then(|| {
+                let mut c = p.clone();
+                c.push(0);
+                c
+            })
+        });
+        if let Some(c) = child {
+            self.select_path(&c);
+        }
     }
 
     // ---- selection / editors ----------------------------------------------
@@ -922,6 +1045,11 @@ impl App {
             // lands on the first node.
             self.dstate.borrow_mut().selected = Some(path_key(path));
             self.dirty_state.set(true);
+            // Without this nothing holds keyboard focus after a document opens,
+            // so Enter and Tab silently do nothing until the user clicks a row.
+            // `run` grabs the title entry afterwards for a freshly made node, so
+            // this does not fight the new-node flow.
+            self.list.grab_focus();
         }
     }
 
@@ -1003,6 +1131,7 @@ impl App {
     }
 
     fn save_state(&self) {
+        self.capture_collapsed();
         if let Some(path) = self.path.borrow().clone() {
             state::save_doc_state(&path, &self.dstate.borrow());
         }

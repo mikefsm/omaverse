@@ -77,7 +77,8 @@ In the outline pane:
 | `Enter` | New node below |
 | `Tab` / `Shift+Tab` | Indent / outdent |
 | `Alt+↑` / `Alt+↓` | Move up / down |
-| `←` / `→` | Collapse / expand |
+| `←` | Collapse, or step out to the parent |
+| `→` | Expand, or step in to the first child |
 | `Delete` | Delete node (confirms if it has notes or children) |
 | `F2` | Rename — jumps to the title field |
 
@@ -86,10 +87,12 @@ Anywhere:
 | Key | Action |
 |---|---|
 | `Ctrl+Enter` | Jump between title and body |
+| `Escape` | Back to the outline pane |
 | `Ctrl+N` | New outline (opens a file chooser) |
 | `Ctrl+O` | Open an outline |
 | `Ctrl+S` | Save now (autosave already runs every 800 ms) |
 | `Ctrl+\\` | Toggle the library sidebar |
+| `Ctrl+W` / `Ctrl+Q` | Close (saves first) |
 
 A node's title is edited in the field above the body, not in the tree. `Enter`
 there drops into the body, which is the order you write in. Pressing `Enter` in

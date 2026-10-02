@@ -7,9 +7,12 @@ mod nodeobj;
 mod parse;
 mod state;
 
+use gtk4::gio;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use std::cell::RefCell;
 use std::io::Write;
+use std::rc::Rc;
 use std::path::{Path, PathBuf};
 
 pub const APP_ID: &str = "org.mikefsm.omaverse";
@@ -32,13 +35,50 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn main() -> glib::ExitCode {
-    let cli: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        // HANDLES_OPEN so that `omaverse some.md` while omaverse is already
+        // running opens that file in the existing window. Without it GApplication
+        // hands off to the running instance and the argument is silently dropped.
+        .flags(gio::ApplicationFlags::HANDLES_OPEN)
+        .build();
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
-    // The file is taken from argv directly rather than through GApplication's
-    // open handler, which keeps startup to a single path.
-    app.connect_activate(move |a| app::build(a, cli.clone()));
-    app.run_with_args::<&str>(&[])
+    // The one window, created on first activation and reused thereafter.
+    let window: Rc<RefCell<Option<Rc<app::App>>>> = Rc::new(RefCell::new(None));
+
+    app.connect_activate({
+        let w = window.clone();
+        move |a| show(a, &w, None)
+    });
+    app.connect_open({
+        let w = window.clone();
+        move |a, files, _hint| {
+            let path = files.first().and_then(|f| f.path());
+            show(a, &w, path);
+        }
+    });
+    app.run()
+}
+
+fn show(
+    gapp: &adw::Application,
+    slot: &Rc<RefCell<Option<Rc<app::App>>>>,
+    path: Option<PathBuf>,
+) {
+    let existing = slot.borrow().clone();
+    match existing {
+        Some(win) => {
+            if let Some(p) = path {
+                win.open(&p);
+            }
+            win.present();
+        }
+        None => {
+            let win = app::build(gapp, path);
+            *slot.borrow_mut() = Some(win.clone());
+            win.present();
+        }
+    }
 }
 
 use gtk4::glib;
