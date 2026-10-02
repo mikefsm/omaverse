@@ -107,6 +107,7 @@ Anywhere:
 | `Ctrl+O` | Open an outline |
 | `Ctrl+S` | Save now (autosave already runs every 800 ms) |
 | `Ctrl+\\` | Toggle the library sidebar |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo (also `Ctrl+Y`) |
 | `Ctrl+W` / `Ctrl+Q` | Close (saves first) |
 
 ## Install

@@ -401,6 +401,13 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
                 return glib::Propagation::Stop;
             } else if key == gdk::Key::Delete {
                 Cmd::Delete
+            } else if ctrl && (key == gdk::Key::z || key == gdk::Key::Z) {
+                if shift {
+                    a.redo();
+                } else {
+                    a.undo();
+                }
+                return glib::Propagation::Stop;
             } else if ctrl && (key == gdk::Key::m || key == gdk::Key::M) {
                 Cmd::MergeIntoPrevious
             } else if ctrl && (key == gdk::Key::x || key == gdk::Key::X) {
@@ -457,6 +464,17 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
                 a.focus_outline();
                 return glib::Propagation::Stop;
             }
+            // Undo and redo are handled here rather than left to accelerators:
+            // <Primary><Shift>z never matched, while the same two-modifier
+            // combination reaches this controller reliably.
+            if ctrl && (key == gdk::Key::z || key == gdk::Key::Z) {
+                if shift {
+                    a.redo();
+                } else {
+                    a.undo();
+                }
+                return glib::Propagation::Stop;
+            }
             // Annotate the selection, or reopen the note the cursor sits in.
             if ctrl && shift && (key == gdk::Key::a || key == gdk::Key::A) {
                 a.annotate_selection();
@@ -503,6 +521,16 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         let a = app.clone();
         move || a.open_dialog()
     });
+    // Undo and redo as window actions rather than the text view's own bindings,
+    // so they work from the outline pane too.
+    add_action(&window, "undo", {
+        let a = app.clone();
+        move || a.undo()
+    });
+    add_action(&window, "redo", {
+        let a = app.clone();
+        move || a.redo()
+    });
     add_action(&window, "close", {
         let w = window.clone();
         move || w.close()
@@ -512,6 +540,13 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     gapp.set_accels_for_action("win.new-outline", &["<Primary>n"]);
     gapp.set_accels_for_action("win.open-outline", &["<Primary>o"]);
     gapp.set_accels_for_action("win.close", &["<Primary>w", "<Primary>q"]);
+    gapp.set_accels_for_action("win.undo", &["<Primary>z"]);
+    // Both spellings: with Shift held the keyval is uppercase, and matching
+    // only the lower-case form silently never fires.
+    gapp.set_accels_for_action(
+        "win.redo",
+        &["<Primary><Shift>z", "<Primary><Shift>Z", "<Primary>y"],
+    );
 
     // Styling keeps up with typing; re-parsing and saving run slower.
     {
@@ -1057,6 +1092,7 @@ impl App {
         }
         self.set_text(&parse::serialize(&doc));
         *self.doc.borrow_mut() = doc;
+        self.apply_folds();
         self.dirty_doc.set(true);
     }
 
@@ -1068,6 +1104,7 @@ impl App {
         text = unwrap_anchor(&text, id);
         self.set_text(&text);
         *self.doc.borrow_mut() = parse::parse(&text);
+        self.apply_folds();
         self.dirty_doc.set(true);
     }
 
@@ -1205,6 +1242,31 @@ impl App {
     // ---- document rendering ------------------------------------------------
 
     /// The line the cursor is on; emphasis markers stay visible there.
+    /// Step back. Folding is excluded from the history, so undo moves through
+    /// edits rather than through the view being tidied around them.
+    fn undo(&self) {
+        if !self.buffer.can_undo() {
+            return;
+        }
+        self.buffer.undo();
+        self.after_history_change();
+    }
+
+    fn redo(&self) {
+        if !self.buffer.can_redo() {
+            return;
+        }
+        self.buffer.redo();
+        self.after_history_change();
+    }
+
+    fn after_history_change(&self) {
+        self.dirty_doc.set(true);
+        self.dirty_style.set(true);
+        self.dirty_cursor.set(true);
+        self.refresh_structure();
+    }
+
     fn cursor_line(&self) -> i32 {
         self.buffer.iter_at_mark(&self.buffer.get_insert()).line()
     }
@@ -1286,6 +1348,13 @@ impl App {
         // Descending, so each deletion leaves earlier line numbers valid.
         ranges.sort_by_key(|&(s, _)| std::cmp::Reverse(s));
 
+        if ranges.is_empty() {
+            // begin_irreversible_action clears the whole undo history, and this
+            // runs on every restyle. Calling it when there is nothing to fold
+            // wiped undo several times a second.
+            docview::restyle_range(&self.buffer, 0, i32::MAX, self.cursor_line());
+            return;
+        }
         self.loading.set(true);
         self.buffer.begin_irreversible_action();
         for (start, end) in ranges {
@@ -1600,9 +1669,8 @@ impl App {
     }
 
     fn run(&self, cmd: Cmd, at: Option<NodePath>) {
-        // Restructuring rewrites the whole buffer, so nothing may be parked.
+        // Restructuring rewrites the whole buffer from the full document.
         self.unfold_all();
-        self.folds.borrow_mut().clear();
         let mut doc = parse::parse(&self.text());
         let Some(out) = edit::apply(&mut doc, at.as_deref(), cmd) else { return };
         if let Some(node) = out.lifted {
@@ -1631,6 +1699,11 @@ impl App {
 
     fn set_text(&self, text: &str) {
         self.loading.set(true);
+        // Replacing the buffer invalidates every parked fold. Their marks
+        // collapse to the start, and `text` already contains everything, so
+        // keeping them would splice each folded section in a second time at the
+        // top of the file -- which is exactly what corrupted a document.
+        self.folds.borrow_mut().clear();
         self.buffer.set_text(text);
         docview::restyle(&self.buffer);
         self.loading.set(false);
