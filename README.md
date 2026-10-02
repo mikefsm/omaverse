@@ -1,4 +1,4 @@
-# omaverse
+# Omaverse
 
 A small scripture outlining app for omarchy. Collapsible outline tree on the
 left, free-text body for the selected node on the right, plain Markdown on disk.

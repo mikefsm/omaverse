@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=omaverse
+Name=Omaverse
 GenericName=Scripture Outliner
 Comment=Outline books of scripture as collapsible sections in plain Markdown
 Exec=omaverse %f

@@ -265,7 +265,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
 
     let window = adw::ApplicationWindow::builder()
         .application(gapp)
-        .title("omaverse")
+        .title("Omaverse")
         .default_width(wstate.width.unwrap_or(1180))
         .default_height(wstate.height.unwrap_or(760))
         .content(&split)
@@ -1940,7 +1940,7 @@ impl App {
         self.wtitle.set_title(&title);
         self.wtitle.set_subtitle(&self.pretty(path));
         self.wtitle.remove_css_class("oma-error");
-        self.window.set_title(Some(&format!("{title} — omaverse")));
+        self.window.set_title(Some(&format!("{title} — Omaverse")));
         self.stack.set_visible_child_name("doc");
 
         self.rebuild_tree();
