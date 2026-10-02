@@ -108,9 +108,21 @@ Anywhere:
 | `Ctrl+\\` | Toggle the library sidebar |
 | `Ctrl+W` / `Ctrl+Q` | Close (saves first) |
 
-## Build
+## Install
 
 Needs Rust, GTK 4.12+, and libadwaita 1.5+.
+
+```sh
+./install.sh
+```
+
+That builds, then puts the binary in `~/.local/bin`, a desktop entry in
+`~/.local/share/applications` and an icon in `~/.local/share/icons`, so omaverse
+appears in the omarchy launcher and opens `.md` files on double-click. The
+desktop entry is named for the application id so the window picks up its icon
+under Wayland.
+
+To run without installing:
 
 ```sh
 cargo build --release

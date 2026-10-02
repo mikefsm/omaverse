@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="page" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3350"/>
+      <stop offset="1" stop-color="#171c2e"/>
+    </linearGradient>
+  </defs>
+  <rect x="14" y="10" width="100" height="108" rx="14" fill="url(#page)"/>
+  <rect x="14" y="10" width="100" height="108" rx="14" fill="none"
+        stroke="#4a5578" stroke-width="2"/>
+  <!-- top level -->
+  <path d="M34 36 l9 6 -9 6 z" fill="#82fb9c"/>
+  <rect x="50" y="37" width="46" height="8" rx="4" fill="#dff3ff"/>
+  <!-- nested -->
+  <path d="M46 60 l9 6 -9 6 z" fill="#82fb9c" opacity="0.8"/>
+  <rect x="62" y="61" width="34" height="7" rx="3.5" fill="#b9c7e4"/>
+  <!-- leaf lines -->
+  <rect x="62" y="80" width="34" height="5" rx="2.5" fill="#7d89ab"/>
+  <rect x="62" y="93" width="24" height="5" rx="2.5" fill="#7d89ab"/>
+</svg>

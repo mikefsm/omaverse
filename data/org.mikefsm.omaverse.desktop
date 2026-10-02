@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=omaverse
+GenericName=Scripture Outliner
+Comment=Outline books of scripture as collapsible sections in plain Markdown
+Exec=omaverse %f
+Icon=org.mikefsm.omaverse
+Terminal=false
+Categories=Office;WordProcessor;
+Keywords=outline;scripture;bible;sermon;notes;markdown;
+MimeType=text/markdown;text/x-markdown;
+StartupNotify=true
+StartupWMClass=org.mikefsm.omaverse
