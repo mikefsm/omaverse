@@ -103,6 +103,11 @@ pub struct Interlinear {
     /// Which fields to show beneath each word, in order.
     #[serde(default = "default_rows")]
     pub rows: Vec<String>,
+    /// The next id to hand out, when it cannot be worked out from the words
+    /// present. Only written once a word has been removed, since until then
+    /// the highest id in the file says the same thing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_id: Option<u32>,
     #[serde(default)]
     pub words: Vec<Word>,
 }
@@ -113,16 +118,36 @@ impl Interlinear {
             reference: reference.into(),
             language,
             rows: default_rows(),
+            next_id: None,
             words: Vec::new(),
         }
     }
 
     pub fn parse(text: &str) -> Result<Interlinear, toml::de::Error> {
-        toml::from_str(text)
+        let mut sheet: Interlinear = toml::from_str(text)?;
+        sheet.tidy();
+        Ok(sheet)
     }
 
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).unwrap_or_default()
+    }
+
+    /// One past the highest `wN` present, which is what the next id would be if
+    /// no word had ever been removed.
+    fn implied_next(&self) -> u32 {
+        self.words
+            .iter()
+            .filter_map(|w| w.id.strip_prefix('w')?.parse::<u32>().ok())
+            .max()
+            .map_or(1, |n| n + 1)
+    }
+
+    /// Drop the stored counter when the words themselves already imply it, so
+    /// an ordinary file carries no bookkeeping.
+    fn tidy(&mut self) {
+        let implied = self.implied_next();
+        self.next_id = self.next_id.filter(|&n| n > implied);
     }
 
     pub fn word(&self, id: &str) -> Option<&Word> {
@@ -133,12 +158,41 @@ impl Interlinear {
         self.words.iter_mut().find(|w| w.id == id)
     }
 
-    /// An id not already taken.
-    pub fn fresh_id(&self) -> String {
-        (1..)
-            .map(|n| format!("w{n}"))
-            .find(|id| self.word(id).is_none())
-            .unwrap_or_default()
+    /// Take a word out, handing back where it was so it can be put back.
+    ///
+    /// Pasted passages carry verse numbers and footnote marks that are not
+    /// words at all, and they have to go.
+    pub fn remove_word(&mut self, id: &str) -> Option<(usize, Word)> {
+        let at = self.words.iter().position(|w| w.id == id)?;
+        // Remember how far the numbering had got before the word leaves, or
+        // removing the highest would free its id for reuse.
+        let high = self.next_id.unwrap_or(0).max(self.implied_next());
+        let word = self.words.remove(at);
+        self.next_id = Some(high);
+        self.tidy();
+        Some((at, word))
+    }
+
+    /// Put a removed word back where it came from.
+    pub fn insert_word(&mut self, at: usize, word: Word) {
+        let at = at.min(self.words.len());
+        self.words.insert(at, word);
+        self.tidy();
+    }
+
+    /// An id never used before in this sheet.
+    pub fn fresh_id(&mut self) -> String {
+        let mut n = self.next_id.unwrap_or(0).max(self.implied_next());
+        loop {
+            let id = format!("w{n}");
+            n += 1;
+            // A hand-written file may use ids of its own shape; step over
+            // anything already taken.
+            if self.word(&id).is_none() {
+                self.next_id = Some(n);
+                return id;
+            }
+        }
     }
 
     /// Add the words of a pasted passage, keeping anything already here.
@@ -147,6 +201,7 @@ impl Interlinear {
             let id = self.fresh_id();
             self.words.push(Word::new(id, token));
         }
+        self.tidy();
     }
 }
 
@@ -234,6 +289,64 @@ mod tests {
         assert_eq!(w.field("lemma"), None);
         w.set_field("gloss", "   ");
         assert_eq!(w.field("gloss"), None, "blanking clears it");
+    }
+
+    #[test]
+    fn removing_a_word_can_be_undone_exactly() {
+        let mut sheet = Interlinear::new("Jude 4", Language::Greek);
+        sheet.append_text("alpha 4 beta");
+        sheet.word_mut("w2").unwrap().set_field("note", "a verse number");
+
+        let (at, word) = sheet.remove_word("w2").expect("the word is there");
+        assert_eq!(at, 1);
+        let ids: Vec<&str> = sheet.words.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["w1", "w3"], "the others keep their ids");
+
+        sheet.insert_word(at, word);
+        let ids: Vec<&str> = sheet.words.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["w1", "w2", "w3"], "back in its own place");
+        assert_eq!(sheet.word("w2").unwrap().field("note"), Some("a verse number"));
+    }
+
+    #[test]
+    fn removing_a_word_that_is_not_there_changes_nothing() {
+        let mut sheet = Interlinear::new("Jude 4", Language::Greek);
+        sheet.append_text("alpha");
+        assert!(sheet.remove_word("w9").is_none());
+        assert_eq!(sheet.words.len(), 1);
+    }
+
+    #[test]
+    fn a_removed_id_is_not_handed_out_again() {
+        // Diagrams point at words by id, so a freed id must stay free.
+        let mut sheet = Interlinear::new("Jude 4", Language::Greek);
+        sheet.append_text("alpha beta");
+        sheet.remove_word("w1");
+        sheet.append_text("gamma");
+        let ids: Vec<&str> = sheet.words.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["w2", "w3"], "w1 is gone for good");
+    }
+
+    #[test]
+    fn removing_the_last_word_does_not_free_its_id() {
+        let mut sheet = Interlinear::new("Jude 4", Language::Greek);
+        sheet.append_text("alpha beta");
+        sheet.remove_word("w2");
+        // The counter has to outlive the word, so it is written down.
+        let text = sheet.to_toml();
+        assert!(text.contains("next_id = 3"), "got: {text}");
+
+        let mut back = Interlinear::parse(&text).expect("should parse");
+        back.append_text("gamma");
+        let ids: Vec<&str> = back.words.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["w1", "w3"], "across a save and reload too");
+    }
+
+    #[test]
+    fn an_ordinary_sheet_carries_no_counter() {
+        let mut sheet = Interlinear::new("Jude 4", Language::Greek);
+        sheet.append_text("alpha beta");
+        assert!(!sheet.to_toml().contains("next_id"), "nothing to record yet");
     }
 
     #[test]

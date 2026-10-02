@@ -7,6 +7,7 @@
 
 use crate::interlinear::Interlinear;
 use gtk4 as gtk;
+use gtk4::glib;
 use gtk4::pango;
 use gtk4::prelude::*;
 use std::cell::RefCell;
@@ -100,6 +101,35 @@ impl WordGrid {
             self.flow.select_child(&child);
             child.grab_focus();
         }
+    }
+
+    /// Delete and Backspace remove the word the keyboard is on, so a run of
+    /// verse numbers can be cleared without reaching for the mouse.
+    pub fn connect_delete(&self, f: impl Fn(String) + 'static) {
+        let ids = self.ids.clone();
+        let keys = gtk::EventControllerKey::new();
+        let flow = self.flow.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk4::gdk::Key::Delete && key != gtk4::gdk::Key::BackSpace {
+                return glib::Propagation::Proceed;
+            }
+            let Some(child) = flow.selected_children().first().cloned() else {
+                return glib::Propagation::Proceed;
+            };
+            let index = child.index();
+            if index < 0 {
+                return glib::Propagation::Proceed;
+            }
+            let id = ids.borrow().get(index as usize).cloned();
+            match id {
+                Some(id) => {
+                    f(id);
+                    glib::Propagation::Stop
+                }
+                None => glib::Propagation::Proceed,
+            }
+        });
+        self.flow.add_controller(keys);
     }
 
     pub fn connect_activated(&self, f: impl Fn(String) + 'static) {

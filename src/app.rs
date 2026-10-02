@@ -100,6 +100,11 @@ pub struct App {
     note_open: Cell<bool>,
     /// The fold triangles drawn beside the text.
     gutter: RefCell<Option<gtk::DrawingArea>>,
+    toasts: adw::ToastOverlay,
+    /// The undo offer for the last removed word. Only the most recent removal
+    /// can be taken back: an older offer would put its word back at an index
+    /// that has since moved.
+    last_removal: RefCell<Option<adw::Toast>>,
     /// The interlinear surface, shown instead of the outline for a sheet.
     grid: WordGrid,
     sheet: RefCell<Option<Interlinear>>,
@@ -281,12 +286,17 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     shell.set_content(Some(&stack));
     split.set_content(Some(&shell));
 
+    // Removing a word takes its annotations with it, so the removal is
+    // announced with a way back.
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&split));
+
     let window = adw::ApplicationWindow::builder()
         .application(gapp)
         .title("Omaverse")
         .default_width(wstate.width.unwrap_or(1180))
         .default_height(wstate.height.unwrap_or(760))
-        .content(&split)
+        .content(&toasts)
         .build();
 
     let app = Rc::new(App {
@@ -314,6 +324,8 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         view: view.clone(),
         buffer: buffer.clone(),
         libbox: libbox.clone(),
+        toasts: toasts.clone(),
+        last_removal: RefCell::new(None),
         lib_paths: RefCell::new(Vec::new()),
         recent: RefCell::new(wstate.recent.clone()),
         folds: RefCell::new(Vec::new()),
@@ -345,6 +357,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         app.grid.connect_activated(move |id| a.edit_word(&id));
+    }
+    {
+        let a = app.clone();
+        app.grid.connect_delete(move |id| a.remove_word(&id));
     }
     {
         let a = app.clone();
@@ -2014,6 +2030,7 @@ impl App {
     // ---- documents ---------------------------------------------------------
 
     pub fn open(&self, path: &PathBuf) {
+        self.dismiss_removal_offer();
         // Whatever is open goes to disk first, whichever kind is arriving:
         // autosave is on a timer, so switching can otherwise outrun it.
         if self.path.borrow().is_some() {
@@ -2378,6 +2395,10 @@ impl App {
         }
 
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+        remove.set_tooltip_text(Some("Remove this word (Delete)"));
+        remove.add_css_class("flat");
+        actions.append(&remove);
         let next = gtk::Button::with_label("Save and next");
         next.set_hexpand(true);
         next.set_halign(gtk::Align::End);
@@ -2417,6 +2438,19 @@ impl App {
                 commit();
                 popover.popdown();
                 me.edit_next_after(&id);
+            });
+        }
+        {
+            let me = self.clone();
+            let id = id.to_string();
+            let popover = popover.clone();
+            remove.connect_clicked(move |_| {
+                // Closing first keeps the popover from pointing at a word that
+                // is no longer there.
+                popover.popdown();
+                let me = me.clone();
+                let id = id.clone();
+                glib::idle_add_local_once(move || me.remove_word(&id));
             });
         }
         {
@@ -2467,6 +2501,59 @@ impl App {
                 entry.grab_focus();
             }
         });
+    }
+
+    /// Take a word out of the sheet. Pasted passages carry verse numbers and
+    /// footnote marks, and they are not words.
+    fn remove_word(self: &Rc<Self>, id: &str) {
+        let removed = {
+            let mut held = self.sheet.borrow_mut();
+            let Some(sheet) = held.as_mut() else { return };
+            sheet.remove_word(id)
+        };
+        let Some((at, word)) = removed else { return };
+
+        if let Some(sheet) = self.sheet.borrow().as_ref() {
+            self.grid.show(sheet);
+        }
+        self.dirty_doc.set(true);
+        // Stay where the deleted word was, so a run of them clears with
+        // repeated presses.
+        self.grid.focus_word(at);
+
+        let toast = adw::Toast::new(&format!("Removed “{}”", word.text));
+        toast.set_button_label(Some("Undo"));
+        let me = self.clone();
+        let restored = RefCell::new(Some(word));
+        // The offer only stands for the sheet it was made about.
+        let on_path = self.path.borrow().clone();
+        toast.connect_button_clicked(move |_| {
+            if *me.path.borrow() != on_path {
+                return;
+            }
+            let Some(word) = restored.borrow_mut().take() else { return };
+            {
+                let mut held = me.sheet.borrow_mut();
+                let Some(sheet) = held.as_mut() else { return };
+                sheet.insert_word(at, word);
+            }
+            if let Some(sheet) = me.sheet.borrow().as_ref() {
+                me.grid.show(sheet);
+            }
+            me.dirty_doc.set(true);
+            me.grid.focus_word(at);
+        });
+        self.dismiss_removal_offer();
+        *self.last_removal.borrow_mut() = Some(toast.clone());
+        self.toasts.add_toast(toast);
+    }
+
+    /// Withdraw a standing undo offer, so it cannot be taken up once the
+    /// positions it refers to have moved on.
+    fn dismiss_removal_offer(&self) {
+        if let Some(toast) = self.last_removal.borrow_mut().take() {
+            toast.dismiss();
+        }
     }
 
     fn apply_word_edit(&self, id: &str, text: &str, entries: &[(&str, gtk::Entry)]) {
