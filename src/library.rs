@@ -4,18 +4,24 @@
 
 use std::path::{Path, PathBuf};
 
-/// What kind of document a file holds. The extension says it: an outline is
-/// prose, an interlinear is a record set, and they are not the same thing.
+/// What kind of document a file holds. An outline is prose, an interlinear is a
+/// record set, and a diagram is a drawing; they are not the same thing. The
+/// extension separates prose from the rest, and the file's own `kind` key
+/// separates the two sorts of TOML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Outline,
     Interlinear,
+    Diagram,
 }
 
 pub fn kind_of(path: &Path) -> Option<Kind> {
     match path.extension()?.to_str()? {
         "md" => Some(Kind::Outline),
-        "toml" => Some(Kind::Interlinear),
+        "toml" => match read_head(path, 512) {
+            Ok(head) if crate::diagram::is_diagram(&head) => Some(Kind::Diagram),
+            _ => Some(Kind::Interlinear),
+        },
         _ => None,
     }
 }
@@ -38,7 +44,7 @@ pub struct Group {
 /// filename. Only the head of the file is read.
 pub fn title_of(path: &Path) -> String {
     if let Ok(s) = read_head(path, 4096) {
-        if kind_of(path) == Some(Kind::Interlinear) {
+        if matches!(kind_of(path), Some(Kind::Interlinear) | Some(Kind::Diagram)) {
             for line in s.lines().take(10) {
                 if let Some(rest) = line.trim().strip_prefix("reference") {
                     if let Some(value) = rest.trim().strip_prefix('=') {

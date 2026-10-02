@@ -1,5 +1,7 @@
 mod app;
+mod canvas;
 mod config;
+mod diagram;
 mod docview;
 mod edit;
 mod interlinear;

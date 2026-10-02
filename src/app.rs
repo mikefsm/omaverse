@@ -8,6 +8,8 @@
 use crate::config::{self, Config};
 use crate::docview;
 use crate::edit::{self, Cmd};
+use crate::canvas::Canvas;
+use crate::diagram::Diagram;
 use crate::interlinear::Interlinear;
 use crate::library;
 use crate::wordgrid::WordGrid;
@@ -45,6 +47,12 @@ const CSS: &str = "
 .oma-word-entry { font-family: 'SBL BibLit','SBL Hebrew','SBL Greek',serif; font-size: 14pt; }
 .oma-group { font-size: 9pt; font-weight: bold; letter-spacing: 0.04em; }
 .oma-error { color: #e01b24; }
+.oma-badge { font-size: 8pt; opacity: 0.55; letter-spacing: 0.03em;
+             border: 1px solid alpha(currentColor, 0.3); border-radius: 4px; padding: 0 4px; }
+.oma-canvas { background: @view_bg_color; }
+.oma-bank { background: @headerbar_bg_color; }
+.oma-chip { font-family: 'SBL BibLit','SBL Hebrew','SBL Greek',serif; font-size: 15pt;
+            padding: 2px 8px; border-radius: 6px; background: alpha(currentColor, 0.09); }
 ";
 
 pub struct App {
@@ -108,6 +116,9 @@ pub struct App {
     /// The interlinear surface, shown instead of the outline for a sheet.
     grid: WordGrid,
     sheet: RefCell<Option<Interlinear>>,
+    /// The diagramming surface. It owns the open diagram; `App` only asks for
+    /// it when saving.
+    canvas: Canvas,
     /// None when no dictionary is installed; spelling is simply not marked then.
     speller: Option<crate::spell::Speller>,
     /// A section lifted by Cut, waiting to be pasted. Kept here rather than on
@@ -229,11 +240,13 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         .build();
 
     let grid = WordGrid::new();
+    let canvas = Canvas::new();
 
     let stack = gtk::Stack::new();
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&paned, Some("doc"));
     stack.add_named(&grid.root, Some("interlinear"));
+    stack.add_named(&canvas.root, Some("diagram"));
     stack.set_visible_child_name("empty");
 
     // ---- library sidebar ---------------------------------------------------
@@ -247,6 +260,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     let new_menu = gio::Menu::new();
     new_menu.append(Some("New outline"), Some("win.new-outline"));
     new_menu.append(Some("New interlinear"), Some("win.new-interlinear"));
+    new_menu.append(Some("Diagram this interlinear"), Some("win.make-diagram"));
     let new_btn = gtk::MenuButton::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("New document")
@@ -337,6 +351,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         gutter: RefCell::new(None),
         grid,
         sheet: RefCell::new(None),
+        canvas,
         speller: crate::spell::Speller::new(),
     });
 
@@ -361,6 +376,14 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         app.grid.connect_delete(move |id| a.remove_word(&id));
+    }
+    {
+        let a = app.clone();
+        app.canvas.connect_changed(move || a.dirty_doc.set(true));
+    }
+    {
+        let a = app.clone();
+        app.canvas.connect_open_source(move |name| a.open_beside(&name));
     }
     {
         let a = app.clone();
@@ -598,6 +621,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         let a = app.clone();
         move || a.new_interlinear()
     });
+    add_action(&window, "make-diagram", {
+        let a = app.clone();
+        move || a.make_diagram()
+    });
     add_action(&window, "open-outline", {
         let a = app.clone();
         move || a.open_dialog()
@@ -652,7 +679,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         glib::timeout_add_local(Duration::from_millis(SAVE_DOC_MS), move || {
             if a.dirty_doc.get() && !a.conflict.get() {
                 a.dirty_doc.set(false);
-                if a.sheet.borrow().is_none() {
+                if a.sheet.borrow().is_none() && a.canvas.take().is_none() {
                     a.refresh_structure();
                 }
                 a.save_doc();
@@ -2039,13 +2066,21 @@ impl App {
             self.dirty_doc.set(false);
             self.dirty_state.set(false);
         }
-        if library::kind_of(path) == Some(library::Kind::Interlinear) {
-            self.open_interlinear(path);
-            return;
+        match library::kind_of(path) {
+            Some(library::Kind::Interlinear) => {
+                self.open_interlinear(path);
+                return;
+            }
+            Some(library::Kind::Diagram) => {
+                self.open_diagram(path);
+                return;
+            }
+            _ => {}
         }
 
         let src = std::fs::read_to_string(path).unwrap_or_default();
         *self.sheet.borrow_mut() = None;
+        self.canvas.clear();
         *self.path.borrow_mut() = Some(path.clone());
         *self.dstate.borrow_mut() = state::load_doc_state(path);
         *self.selected.borrow_mut() = None;
@@ -2608,6 +2643,146 @@ impl App {
         }
     }
 
+    // ---- diagrams ----------------------------------------------------------
+
+    /// Start a diagram from the sheet that is open: the same passage, every
+    /// word already to hand in the bank.
+    fn make_diagram(self: &Rc<Self>) {
+        let Some(sheet) = self.sheet.borrow().clone() else {
+            self.wtitle
+                .set_subtitle("Open an interlinear first — a diagram starts from its words");
+            return;
+        };
+        let source = self
+            .path
+            .borrow()
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string());
+        let reference = sheet.reference.clone();
+        let diagram = Diagram::from_interlinear(&sheet, source);
+
+        let safe: String = reference
+            .chars()
+            .map(|c| if std::path::is_separator(c) || c == ':' { '-' } else { c })
+            .collect();
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        let toml = gtk::FileFilter::new();
+        toml.set_name(Some("Diagram"));
+        toml.add_suffix("toml");
+        filters.append(&toml);
+
+        let dialog = gtk::FileDialog::builder()
+            .title("New diagram")
+            .accept_label("Create")
+            .initial_folder(&self.chooser_start_dir())
+            .initial_name(format!("{safe} diagram.toml"))
+            .filters(&filters)
+            .default_filter(&toml)
+            .modal(true)
+            .build();
+        let me = self.clone();
+        dialog.save(Some(&self.window), gio::Cancellable::NONE, move |res| {
+            if let Some(path) = res.ok().and_then(|f| f.path()) {
+                me.create_diagram_at(&path, diagram);
+            }
+        });
+    }
+
+    fn create_diagram_at(&self, chosen: &Path, diagram: Diagram) {
+        let text = chosen.to_string_lossy();
+        let path = if text.ends_with(".toml") {
+            chosen.to_path_buf()
+        } else {
+            PathBuf::from(format!("{text}.toml"))
+        };
+        // The same rule as everywhere: never write over something already there.
+        if std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
+            self.refresh_library();
+            self.open(&path);
+            self.wtitle
+                .set_subtitle(&format!("{} — opened the existing diagram", self.pretty(&path)));
+            return;
+        }
+        if let Err(e) = crate::atomic_write(&path, diagram.to_toml().as_bytes()) {
+            eprintln!("omaverse: could not create {}: {e}", path.display());
+            self.wtitle.set_subtitle(&format!("Could not create — {e}"));
+            self.wtitle.add_css_class("oma-error");
+            return;
+        }
+        self.refresh_library();
+        self.open(&path);
+    }
+
+    /// Open a file named relative to the open document's own folder. The link
+    /// from a diagram back to its sheet is stored as a bare file name so the
+    /// pair can be moved or copied together.
+    fn open_beside(&self, name: &str) {
+        let Some(dir) = self.path.borrow().as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        else {
+            return;
+        };
+        let target = dir.join(name);
+        if target.exists() {
+            self.open(&target);
+        } else {
+            self.wtitle
+                .set_subtitle(&format!("{name} is not beside this diagram"));
+        }
+    }
+
+    fn open_diagram(&self, path: &PathBuf) {
+        let src = std::fs::read_to_string(path).unwrap_or_default();
+        let diagram = match Diagram::parse(&src) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("omaverse: {} is not a readable diagram: {e}", path.display());
+                self.wtitle.set_subtitle(&format!("Could not read — {e}"));
+                self.wtitle.add_css_class("oma-error");
+                return;
+            }
+        };
+        *self.sheet.borrow_mut() = None;
+        *self.path.borrow_mut() = Some(path.clone());
+        self.record_stamp(path);
+        self.conflict.set(false);
+
+        let reference = diagram.reference.clone();
+        self.wtitle.set_title(&reference);
+        self.wtitle.set_subtitle(&self.pretty(path));
+        self.wtitle.remove_css_class("oma-error");
+        self.window
+            .set_title(Some(&format!("{reference} — Omaverse")));
+
+        // The bank reads in the passage's own direction.
+        let rtl = diagram
+            .words
+            .first()
+            .map(|w| w.text.chars().any(|c| ('\u{0590}'..='\u{05FF}').contains(&c)))
+            .unwrap_or(false);
+        self.canvas.show(diagram, rtl);
+        self.stack.set_visible_child_name("diagram");
+        self.split.set_show_sidebar(true);
+
+        state::push_recent(&mut self.recent.borrow_mut(), path);
+        self.save_window_state();
+    }
+
+    fn save_diagram(&self, path: &Path, diagram: &Diagram) {
+        match crate::atomic_write(path, diagram.to_toml().as_bytes()) {
+            Ok(()) => {
+                self.record_stamp(path);
+                self.wtitle.set_subtitle(&self.pretty(path));
+                self.wtitle.remove_css_class("oma-error");
+            }
+            Err(e) => {
+                eprintln!("omaverse: could not save {}: {e}", path.display());
+                self.wtitle.set_subtitle(&format!("Not saved — {e}"));
+                self.wtitle.add_css_class("oma-error");
+            }
+        }
+    }
+
     /// Open a sheet. It has no outline and no folding; the whole window is the
     /// passage.
     fn open_interlinear(&self, path: &PathBuf) {
@@ -2631,6 +2806,7 @@ impl App {
         self.window
             .set_title(Some(&format!("{} — Omaverse", sheet.reference)));
 
+        self.canvas.clear();
         self.grid.show(&sheet);
         *self.sheet.borrow_mut() = Some(sheet);
         self.stack.set_visible_child_name("interlinear");
@@ -2671,7 +2847,7 @@ impl App {
             }
             for e in &g.entries {
                 paths.push(Some(e.path.clone()));
-                self.libbox.append(&entry_row(&e.title));
+                self.libbox.append(&entry_row(&e.title, Some(e.kind)));
             }
         }
         let outside: Vec<PathBuf> = self
@@ -2685,7 +2861,7 @@ impl App {
             paths.push(None);
             self.libbox.append(&plain_row("RECENT", &["oma-group"], false));
             for p in outside {
-                let row = entry_row(&library::title_of(&p));
+                let row = entry_row(&library::title_of(&p), library::kind_of(&p));
                 row.set_tooltip_text(Some(&self.pretty(&p)));
                 paths.push(Some(p));
                 self.libbox.append(&row);
@@ -2839,6 +3015,10 @@ kept, so neither is lost.",
             self.save_sheet(&path);
             return;
         }
+        if let Some(diagram) = self.canvas.take() {
+            self.save_diagram(&path, &diagram);
+            return;
+        }
         let mut text = self.full_text();
         if !text.ends_with('\n') && !text.is_empty() {
             text.push('\n');
@@ -2924,18 +3104,34 @@ fn triangle(cr: &gtk4::cairo::Context, x: f64, y: f64, open: bool) {
     cr.close_path();
 }
 
-fn entry_row(title: &str) -> gtk::ListBoxRow {
+/// A document in the sidebar. An interlinear and the diagram made from it carry
+/// the same reference, so the kind is spelled out beside the title rather than
+/// left to be guessed.
+fn entry_row(title: &str, kind: Option<library::Kind>) -> gtk::ListBoxRow {
     let label = gtk::Label::builder()
         .label(title)
         .xalign(0.0)
+        .hexpand(true)
         .ellipsize(pango::EllipsizeMode::End)
         .margin_start(12)
-        .margin_end(12)
         .margin_top(6)
         .margin_bottom(6)
         .build();
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    line.set_margin_end(12);
+    line.append(&label);
+    if let Some(tag) = match kind {
+        Some(library::Kind::Interlinear) => Some("sheet"),
+        Some(library::Kind::Diagram) => Some("diagram"),
+        _ => None,
+    } {
+        let badge = gtk::Label::new(Some(tag));
+        badge.add_css_class("oma-badge");
+        badge.set_valign(gtk::Align::Center);
+        line.append(&badge);
+    }
     let row = gtk::ListBoxRow::new();
-    row.set_child(Some(&label));
+    row.set_child(Some(&line));
     row
 }
 
