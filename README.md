@@ -93,8 +93,8 @@ In the document:
 
 | Key | Action |
 |---|---|
-| `Ctrl+Enter` / `Escape` | Back to the outline pane |
-| `Alt+Enter` | Split the section in two at the cursor |
+| `Ctrl+Enter` | Split the section in two at the cursor |
+| `Escape` | Back to the outline pane |
 
 Anywhere:
 
@@ -139,7 +139,8 @@ internal clipboard, so cutting a section never clobbers what you copied.
 
 `Ctrl+M` is the common case of "this actually belongs with the one above": it
 drops the heading and its text joins the section above, adopting its children.
-`Alt+Enter` is the inverse. Moving *text* rather than sections needs nothing
+`Ctrl+Enter` in the document is the inverse: it splits at the cursor, which is
+also how you impose structure on a book you have just pasted in whole. Moving *text* rather than sections needs nothing
 special — it is one continuous buffer, so ordinary select, cut and paste work
 across section boundaries.
 

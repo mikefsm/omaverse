@@ -378,11 +378,12 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         kc.connect_key_pressed(move |_, key, _, state| {
             let enter = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-            let alt = state.contains(gdk::ModifierType::ALT_MASK);
-            if enter && alt {
+            // Ctrl+Enter splits here rather than returning to the outline, which
+            // Escape already does. Alt+Enter is not available: omarchy binds it.
+            if enter && ctrl {
                 a.split_at_cursor();
                 glib::Propagation::Stop
-            } else if (enter && ctrl) || key == gdk::Key::Escape {
+            } else if key == gdk::Key::Escape {
                 a.focus_outline();
                 glib::Propagation::Stop
             } else {
@@ -496,8 +497,18 @@ impl App {
         // A widget cannot take focus before it is mapped, and the first document
         // opens while the window is still being built.
         let list = self.list.clone();
+        let view = self.view.clone();
+        let tree = self.tree.clone();
         glib::idle_add_local_once(move || {
-            list.grab_focus();
+            // A document with no sections yet -- text pasted in, nothing marked
+            // up -- leaves the outline empty, and an empty list cannot take
+            // focus. Land in the text instead, which is the only place there is
+            // anything to do.
+            if tree.n_items() > 0 {
+                list.grab_focus();
+            } else {
+                view.grab_focus();
+            }
         });
     }
 
@@ -587,8 +598,10 @@ impl App {
             return;
         };
 
+        // Splitting at the very top needs no blank lines above the new heading.
+        let lead = if insert.offset() == 0 { "" } else { "\n\n" };
         let snippet = format!(
-            "\n\n{}- \n\n{}",
+            "{lead}{}- \n\n{}",
             " ".repeat(depth * 2),
             " ".repeat((depth + 1) * 2)
         );
@@ -597,8 +610,11 @@ impl App {
         self.buffer.insert(&mut at, &snippet);
         self.loading.set(false);
 
-        // Land on the new heading, ready to be named.
-        if let Some(mut h) = self.buffer.iter_at_line(line as i32 + 2) {
+        // Land on the new heading, ready to be named. Measured from where the
+        // insertion ended rather than from the line the cursor started on:
+        // `str::lines()` drops a trailing empty line, so that number gets
+        // clamped and is not reliable here.
+        if let Some(mut h) = self.buffer.iter_at_line(at.line() - 2) {
             if !h.ends_line() {
                 h.forward_to_line_end();
             }
@@ -1151,7 +1167,7 @@ impl App {
                 self.scroll_to(&p);
             }
             None if !self.doc.borrow().is_empty() => self.select_path(&[0]),
-            None => {}
+            None => self.focus_document(),
         }
     }
 
