@@ -50,6 +50,9 @@ pub struct App {
 
     dirty_doc: Cell<bool>,
     dirty_style: Cell<bool>,
+    /// The cursor moved; the outline highlight needs catching up on a tick
+    /// rather than synchronously, which would run on every keystroke.
+    dirty_cursor: Cell<bool>,
     dirty_state: Cell<bool>,
     /// Guards against queueing the post-fold work more than once per pass.
     fold_pending: Cell<bool>,
@@ -243,6 +246,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         selected: RefCell::new(None),
         dirty_doc: Cell::new(false),
         dirty_style: Cell::new(false),
+        dirty_cursor: Cell::new(false),
         dirty_state: Cell::new(false),
         fold_pending: Cell::new(false),
         pending_toggles: RefCell::new(Vec::new()),
@@ -293,8 +297,14 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         let a = app.clone();
         buffer.connect_cursor_position_notify(move |_| {
             if !a.loading.get() {
-                a.sync_outline_to_cursor();
+                a.dirty_cursor.set(true);
             }
+        });
+    }
+    {
+        let a = app.clone();
+        doc_scroll.vadjustment().connect_value_changed(move |_| {
+            a.dirty_style.set(true);
         });
     }
     {
@@ -378,17 +388,34 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         kc.connect_key_pressed(move |_, key, _, state| {
             let enter = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            let alt = state.contains(gdk::ModifierType::ALT_MASK);
             // Ctrl+Enter splits here rather than returning to the outline, which
             // Escape already does. Alt+Enter is not available: omarchy binds it.
             if enter && ctrl {
                 a.split_at_cursor();
-                glib::Propagation::Stop
-            } else if key == gdk::Key::Escape {
-                a.focus_outline();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
+                return glib::Propagation::Stop;
             }
+            if key == gdk::Key::Escape {
+                a.focus_outline();
+                return glib::Propagation::Stop;
+            }
+            // Restructuring works here too. Requiring a trip to the outline pane
+            // for it meant these keys silently did nothing in the place the work
+            // actually happens.
+            let cmd = if key == gdk::Key::ISO_Left_Tab || (key == gdk::Key::Tab && shift) {
+                Cmd::Outdent
+            } else if key == gdk::Key::Tab {
+                Cmd::Indent
+            } else if key == gdk::Key::Up && alt {
+                Cmd::MoveUp
+            } else if key == gdk::Key::Down && alt {
+                Cmd::MoveDown
+            } else {
+                return glib::Propagation::Proceed;
+            };
+            a.apply_cmd_in_document(cmd);
+            glib::Propagation::Stop
         });
         kc.set_propagation_phase(gtk::PropagationPhase::Capture);
         doc_scroll.add_controller(kc);
@@ -431,6 +458,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
             if a.dirty_style.get() {
                 a.dirty_style.set(false);
                 a.restyle();
+            }
+            if a.dirty_cursor.get() {
+                a.dirty_cursor.set(false);
+                a.sync_outline_to_cursor();
             }
             glib::ControlFlow::Continue
         });
@@ -711,9 +742,19 @@ impl App {
 
     // ---- document rendering ------------------------------------------------
 
+    /// Lines on screen, plus enough either side to cover a small scroll.
+    fn visible_lines(&self) -> (i32, i32) {
+        let rect = self.view.visible_rect();
+        let (top, _) = self.view.line_at_y(rect.y());
+        let (bottom, _) = self.view.line_at_y(rect.y() + rect.height());
+        const OVERSCAN: i32 = 60;
+        (top.line() - OVERSCAN, bottom.line() + OVERSCAN)
+    }
+
     fn restyle(&self) {
         self.loading.set(true);
-        docview::restyle(&self.buffer);
+        let (first, last) = self.visible_lines();
+        docview::restyle_range(&self.buffer, first, last);
         self.loading.set(false);
         self.apply_folds();
     }
@@ -764,9 +805,17 @@ impl App {
             .collect();
 
         let text = self.text();
+        // Parse once for the whole pass: buffer_line_for parses on every call,
+        // which turned folding into one full parse per folded section.
+        let walk_order = parse::parse(&text);
+        let walk = walk_order.walk();
+        let heads = docview::heading_lines(&text);
         let mut ranges: Vec<(usize, usize)> = outermost
             .iter()
-            .filter_map(|p| self.buffer_line_for(p).map(|l| docview::section_range(&text, l)))
+            .filter_map(|p| {
+                let idx = walk.iter().position(|(q, _)| q == *p)?;
+                heads.get(idx).map(|&l| docview::section_range(&text, l))
+            })
             .collect();
         // Descending, so each deletion leaves earlier line numbers valid.
         ranges.sort_by_key(|&(s, _)| std::cmp::Reverse(s));
@@ -792,7 +841,8 @@ impl App {
         }
         self.buffer.end_irreversible_action();
         self.loading.set(false);
-        docview::restyle(&self.buffer);
+        let (first, last) = self.visible_lines();
+        docview::restyle_range(&self.buffer, first, last);
     }
 
     /// Drop fold state that no longer names a foldable section.
@@ -1045,6 +1095,17 @@ impl App {
     /// Structural commands work on the parsed document and re-render the buffer.
     /// Plain typing never goes through here, so the cost is paid only on the
     /// rare restructuring keystroke.
+    /// Run a structural command without leaving the document. `run` hands focus
+    /// to the outline, which is right when the command came from there and
+    /// wrong when it came from the text.
+    fn apply_cmd_in_document(self: &Rc<Self>, cmd: Cmd) {
+        self.apply_cmd(cmd);
+        let landed = self.selected.borrow().clone();
+        if let Some(p) = landed {
+            self.put_cursor_at(&p);
+        }
+    }
+
     fn apply_cmd(self: &Rc<Self>, cmd: Cmd) {
         let at = self.selected.borrow().clone();
         if cmd.is_destructive() && self.needs_confirmation(at.as_deref()) {

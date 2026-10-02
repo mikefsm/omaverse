@@ -94,6 +94,8 @@ In the document:
 | Key | Action |
 |---|---|
 | `Ctrl+Enter` | Split the section in two at the cursor |
+| `Tab` / `Shift+Tab` | Indent / outdent the section the cursor is in |
+| `Alt+↑` / `Alt+↓` | Move that section up / down |
 | `Escape` | Back to the outline pane |
 
 Anywhere:
@@ -131,6 +133,10 @@ outline pane), live-rendered bold/italic inside body text, installer /
 `.desktop` entry / external-change detection / spellcheck.
 
 ### Reorganising
+
+Restructuring works from either side — the same keys apply to the selected row
+in the outline and to the section the cursor is in while writing, because
+needing to leave the text to reorganise it is exactly when you don't want to.
 
 The outline pane is where sections get moved: `Tab`/`Shift+Tab` to change depth,
 `Alt+↑`/`Alt+↓` between siblings, and dragging for anything further. Cut and paste

@@ -93,47 +93,60 @@ fn indent_px(depth: usize) -> i32 {
     24 + (depth.min(MAX_DEPTH) as i32) * 22
 }
 
-/// Re-apply every appearance tag. Folding is applied separately so that
-/// re-styling never disturbs what is collapsed.
-pub fn restyle(buffer: &gtk::TextBuffer) {
-    let start = buffer.start_iter();
-    let end = buffer.end_iter();
-    let text = buffer.text(&start, &end, true).to_string();
-
-    buffer.remove_tag_by_name("marker", &start, &end);
-    for d in 0..=MAX_DEPTH {
-        buffer.remove_tag_by_name(&format!("h{d}"), &start, &end);
-        buffer.remove_tag_by_name(&format!("b{d}"), &start, &end);
+/// Re-apply appearance tags over a range of lines.
+///
+/// Only a range: classifying is cheap Rust over a string, but applying tags is
+/// GTK work proportional to how many lines are touched, and doing the whole
+/// buffer on every keystroke saturates the CPU on a book-length outline.
+/// Classification still runs over the whole text, because a line's depth
+/// depends on the nearest heading above it.
+pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32) {
+    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
+    let lines = classify(&text);
+    if lines.is_empty() {
+        return;
+    }
+    let first = first.max(0);
+    let last = last.min(lines.len() as i32 - 1);
+    if last < first {
+        return;
     }
 
-    for (i, line) in classify(&text).into_iter().enumerate() {
-        let Some(line_start) = buffer.iter_at_line(i as i32) else { continue };
+    let Some(from) = buffer.iter_at_line(first) else { return };
+    let mut to = buffer.iter_at_line(last).unwrap_or_else(|| buffer.end_iter());
+    if !to.ends_line() {
+        to.forward_to_line_end();
+    }
+    buffer.remove_tag_by_name("marker", &from, &to);
+    for d in 0..=MAX_DEPTH {
+        buffer.remove_tag_by_name(&format!("h{d}"), &from, &to);
+        buffer.remove_tag_by_name(&format!("b{d}"), &from, &to);
+    }
+
+    for i in first..=last {
+        let Some(line_start) = buffer.iter_at_line(i) else { continue };
         let mut line_end = line_start;
         if !line_end.ends_line() {
             line_end.forward_to_line_end();
         }
-        match line {
-            Line::Blank => {}
-            Line::Heading { depth, marker } => {
-                let mut after = line_start;
-                after.forward_chars(marker as i32);
-                if after > line_end {
-                    after = line_end;
-                }
-                buffer.apply_tag_by_name("marker", &line_start, &after);
-                buffer.apply_tag_by_name(&format!("h{}", depth.min(MAX_DEPTH)), &line_start, &line_end);
-            }
-            Line::Body { depth, indent } => {
-                let mut after = line_start;
-                after.forward_chars(indent as i32);
-                if after > line_end {
-                    after = line_end;
-                }
-                buffer.apply_tag_by_name("marker", &line_start, &after);
-                buffer.apply_tag_by_name(&format!("b{}", depth.min(MAX_DEPTH)), &line_start, &line_end);
-            }
+        let (hidden, style) = match lines[i as usize] {
+            Line::Blank => continue,
+            Line::Heading { depth, marker } => (marker, format!("h{}", depth.min(MAX_DEPTH))),
+            Line::Body { depth, indent } => (indent, format!("b{}", depth.min(MAX_DEPTH))),
+        };
+        let mut after = line_start;
+        after.forward_chars(hidden as i32);
+        if after > line_end {
+            after = line_end;
         }
+        buffer.apply_tag_by_name("marker", &line_start, &after);
+        buffer.apply_tag_by_name(&style, &line_start, &line_end);
     }
+}
+
+/// Restyle everything. Only for small buffers or a fresh document.
+pub fn restyle(buffer: &gtk::TextBuffer) {
+    restyle_range(buffer, 0, i32::MAX);
 }
 
 /// The line a section starts on, and the line after everything it contains.
