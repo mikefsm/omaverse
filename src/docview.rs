@@ -18,6 +18,9 @@ pub enum Line {
     /// Body text belonging to the section at `depth`. `indent` counts the
     /// leading spaces to hide.
     Body { depth: usize, indent: usize },
+    /// The document's own `# ` title. Not a section: it cannot be folded, it
+    /// has no place in the outline, and it should not look like one.
+    Title,
     /// A note definition at the foot of the file. Apparatus, not prose, so it
     /// is set apart rather than read as part of the text.
     NoteDef,
@@ -58,8 +61,7 @@ pub fn classify(text: &str) -> Vec<Line> {
             depth = indent / INDENT;
             out.push(Line::Heading { depth, marker: indent + 1 });
         } else if trimmed.starts_with("# ") && indent == 0 {
-            // The document title line.
-            out.push(Line::Heading { depth: 0, marker: 2 });
+            out.push(Line::Title);
         } else {
             out.push(Line::Body { depth, indent });
         }
@@ -249,6 +251,15 @@ pub fn install_tags(buffer: &gtk::TextBuffer) {
         .build();
     table.add(&notedef);
 
+    let title = gtk::TextTag::builder()
+        .name("title")
+        .scale(1.75)
+        .weight(700)
+        .pixels_above_lines(4)
+        .pixels_below_lines(18)
+        .build();
+    table.add(&title);
+
     for (name, build) in [
         ("strong", 0),
         ("em", 1),
@@ -331,6 +342,7 @@ pub fn restyle_range(
         let (hidden, style) = match lines[i as usize] {
             Line::Blank => continue,
             Line::NoteDef => (0, "notedef".to_string()),
+            Line::Title => (2, "title".to_string()),
             Line::Heading { depth, marker } => (marker, format!("h{}", depth.min(MAX_DEPTH))),
             Line::Body { depth, indent } => (indent, format!("b{}", depth.min(MAX_DEPTH))),
         };
@@ -428,17 +440,8 @@ pub fn heading_lines(text: &str) -> Vec<usize> {
     classify(text)
         .into_iter()
         .enumerate()
-        .filter_map(|(i, l)| match l {
-            // The `# Title` line is not a node, only sections are.
-            Line::Heading { marker: 2, depth: 0 } if is_title_line(text, i) => None,
-            Line::Heading { .. } => Some(i),
-            _ => None,
-        })
+        .filter_map(|(i, l)| matches!(l, Line::Heading { .. }).then_some(i))
         .collect()
-}
-
-fn is_title_line(text: &str, index: usize) -> bool {
-    text.lines().nth(index).map(|l| l.starts_with("# ")).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -467,7 +470,7 @@ mod tests {
     #[test]
     fn headings_and_bodies_are_classified_by_depth() {
         let c = classify(DOC);
-        assert_eq!(c[0], Line::Heading { depth: 0, marker: 2 }, "the # title line");
+        assert_eq!(c[0], Line::Title, "the # title line is not a section");
         assert_eq!(c[2], Line::Heading { depth: 0, marker: 2 });
         assert_eq!(c[4], Line::Heading { depth: 1, marker: 4 });
         assert_eq!(c[6], Line::Heading { depth: 2, marker: 6 });

@@ -1258,6 +1258,7 @@ impl App {
             docview::Line::Heading { depth, .. } => Some(*depth),
             docview::Line::Body { depth, .. } => Some(*depth),
             // Splitting has no meaning inside the notes at the foot of the file.
+            docview::Line::Title => Some(0),
             docview::Line::Blank | docview::Line::NoteDef => None,
         }) else {
             return;
@@ -1500,6 +1501,7 @@ impl App {
                 self.cursor_line(),
                 self.speller.as_ref(),
             );
+            self.queue_gutter();
             return;
         }
         self.loading.set(true);
@@ -1948,6 +1950,7 @@ impl App {
 
         self.rebuild_tree();
         self.apply_folds();
+        self.queue_gutter();
 
         self.record_stamp(path);
         self.conflict.set(false);
@@ -2061,7 +2064,6 @@ impl App {
             .unwrap_or_else(|| "Untitled".to_string());
         let mut d = Document::default();
         d.title = Some(name);
-        d.push_root(crate::model::Node::new(""));
         if let Err(e) = crate::atomic_write(&path, parse::serialize(&d).as_bytes()) {
             eprintln!("omaverse: could not create {}: {e}", path.display());
             self.wtitle.set_subtitle(&format!("Could not create outline — {e}"));
