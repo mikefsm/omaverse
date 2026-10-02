@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod edit;
 mod library;
 mod model;
 mod nodeobj;

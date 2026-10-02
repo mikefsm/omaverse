@@ -60,12 +60,30 @@ groups, so `Outlines/New Testament/romans.md` appears under "New Testament".
 
 ## Keys
 
+In the outline pane:
+
 | Key | Action |
 |---|---|
-| `Ctrl+S` | Save now (autosave already runs every 800 ms) |
-| `Ctrl+\` | Toggle the library sidebar |
+| `Enter` | New node below |
+| `Tab` / `Shift+Tab` | Indent / outdent |
+| `Alt+↑` / `Alt+↓` | Move up / down |
+| `←` / `→` | Collapse / expand |
+| `Delete` | Delete node (confirms if it has notes or children) |
+| `F2` | Rename — jumps to the title field |
 
-More arrive with node editing in phase 2.
+Anywhere:
+
+| Key | Action |
+|---|---|
+| `Ctrl+Enter` | Jump between title and body |
+| `Ctrl+N` | New outline |
+| `Ctrl+S` | Save now (autosave already runs every 800 ms) |
+| `Ctrl+\\` | Toggle the library sidebar |
+
+A node's title is edited in the field above the body, not in the tree. `Enter`
+there drops into the body, which is the order you write in. Pressing `Enter` in
+the tree makes a new node and puts the cursor in its title, so a fresh outline is
+type-Enter-type-Enter.
 
 ## Build
 
@@ -78,9 +96,16 @@ cargo build --release
 
 ## Status
 
-Phase 1 of 4. Working: library sidebar, outline tree with persistent fold state,
-body editing, autosave, atomic writes.
+Phases 1 and 2 of 4. Working: library sidebar with folder groups, new outline,
+outline tree with persistent fold state, full keyboard restructuring, rename,
+delete with confirmation, body editing, autosave, atomic writes.
 
-Not yet: creating and restructuring nodes from the keyboard (phase 2),
-live-rendered Markdown in the body pane (phase 3), installer / `.desktop` entry /
-external-change detection / spellcheck (phase 4).
+Not yet: live-rendered Markdown in the body pane (phase 3), installer /
+`.desktop` entry / external-change detection / spellcheck (phase 4).
+
+### Design notes
+
+Structural editing lives in `src/edit.rs` as pure functions of
+(document, selection) → (document, new selection), with no GTK involved, so the
+behaviour is tested without needing a display. The widget handlers only translate
+a keystroke into a command and apply the result.

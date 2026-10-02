@@ -171,8 +171,15 @@ pub fn serialize(doc: &Document) -> String {
 fn emit(node: &Node, depth: usize, out: &mut String) {
     let indent = " ".repeat(depth * INDENT);
     out.push_str(&indent);
-    out.push_str("- ");
-    out.push_str(node.title.trim_end());
+    // A bare "-" rather than "- " keeps trailing whitespace out of the file for
+    // nodes that have not been named yet.
+    let title = node.title.trim_end();
+    if title.is_empty() {
+        out.push('-');
+    } else {
+        out.push_str("- ");
+        out.push_str(title);
+    }
     out.push('\n');
 
     if !node.body.trim().is_empty() {
@@ -314,6 +321,15 @@ mod tests {
         let d = parse(src);
         assert_eq!(d.preamble, "A note before any bullets.");
         assert_eq!(serialize(&d), src);
+    }
+
+    #[test]
+    fn an_unnamed_node_writes_a_bare_dash_and_reads_back() {
+        let mut d = Document::default();
+        d.push_root(Node::new(""));
+        assert_eq!(serialize(&d), "-\n");
+        assert_eq!(parse("-\n").roots.len(), 1);
+        assert_eq!(parse("-\n").roots[0].title, "");
     }
 
     #[test]

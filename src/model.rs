@@ -170,7 +170,9 @@ impl Document {
         Some(p)
     }
 
-    /// Depth-first walk yielding (path, node).
+    /// Depth-first walk yielding (path, node). Used by the test suites to
+    /// assert tree shape; kept here rather than duplicated in each of them.
+    #[allow(dead_code)]
     pub fn walk(&self) -> Vec<(NodePath, &Node)> {
         let mut out = Vec::new();
         fn rec<'a>(nodes: &'a [Node], prefix: &mut NodePath, out: &mut Vec<(NodePath, &'a Node)>) {

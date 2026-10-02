@@ -1,23 +1,25 @@
-//! Phase 1 UI: library sidebar | outline tree | body editor.
+//! UI: library sidebar | outline tree | title + body editor.
 //!
-//! The `Document` is the single source of truth. The tree is rebuilt wholesale
-//! on structural change rather than patched incrementally — outlines run to
-//! hundreds of nodes, not millions, so the simpler code is worth more than the
-//! saved redraws.
+//! The `Document` is the single source of truth. All structural editing goes
+//! through `edit::apply`, which is pure and unit-tested; the handlers here only
+//! translate a keystroke into a `Cmd` and apply the resulting `Outcome`.
 
 use crate::config::{self, Config};
+use crate::edit::{self, Cmd};
 use crate::library;
-use crate::model::{path_key, parse_path_key, Document, NodePath};
+use crate::model::{parse_path_key, path_key, Document, Node, NodePath};
 use crate::nodeobj::NodeObject;
 use crate::parse;
 use crate::state::{self, DocState};
 
 use gtk4 as gtk;
+use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::pango;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use adw::prelude::*;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -29,9 +31,10 @@ const SAVE_STATE_MS: u64 = 2000;
 
 const CSS: &str = "
 .oma-body { font-family: 'Source Serif 4','Noto Serif','DejaVu Serif',serif; font-size: 12.5pt; }
+.oma-title { font-family: 'Source Serif 4','Noto Serif','DejaVu Serif',serif; font-size: 17pt; font-weight: 600; }
+.oma-title:disabled { opacity: 0.3; }
 .oma-outline { font-size: 10.5pt; }
 .oma-group { font-size: 9pt; font-weight: bold; opacity: 0.55; }
-.oma-untitled { opacity: 0.45; font-style: italic; }
 .oma-error { color: #e01b24; }
 ";
 
@@ -41,6 +44,8 @@ pub struct App {
     path: RefCell<Option<PathBuf>>,
     dstate: RefCell<DocState>,
     selected: RefCell<Option<NodePath>>,
+    /// Title text typed but not yet pushed into the model.
+    pending_title: RefCell<Option<String>>,
 
     dirty_doc: Cell<bool>,
     dirty_state: Cell<bool>,
@@ -57,6 +62,8 @@ pub struct App {
     tree: gtk::TreeListModel,
     selection: gtk::SingleSelection,
     list: gtk::ListView,
+    title_entry: gtk::Entry,
+    body_view: gtk::TextView,
     buffer: gtk::TextBuffer,
     libbox: gtk::ListBox,
     lib_paths: RefCell<Vec<Option<PathBuf>>>,
@@ -66,7 +73,6 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
     load_css();
     let cfg = config::load();
     let wstate = state::load_window_state();
-
     let doc: Rc<RefCell<Document>> = Rc::new(RefCell::new(Document::default()));
 
     // ---- outline tree ------------------------------------------------------
@@ -96,56 +102,85 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
 
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().expect("ListItem");
-        let label = gtk::Label::new(None);
-        label.set_xalign(0.0);
-        label.set_ellipsize(pango::EllipsizeMode::End);
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
+        let label = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(pango::EllipsizeMode::End)
+            .build();
         let expander = gtk::TreeExpander::new();
         expander.set_child(Some(&label));
         item.set_child(Some(&expander));
     });
+    factory.connect_unbind(|_, item| {
+        // Drop the title binding, or a recycled row keeps mirroring the old node.
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
+        unsafe {
+            if let Some(b) = item.steal_data::<glib::Binding>("oma-title-binding") {
+                b.unbind();
+            }
+        }
+    });
 
     let list = gtk::ListView::new(Some(selection.clone()), Some(factory.clone()));
     list.add_css_class("oma-outline");
-    list.set_single_click_activate(false);
 
     let outline_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&list)
         .build();
 
-    // ---- body editor -------------------------------------------------------
-    let body = gtk::TextView::builder()
+    // ---- title + body ------------------------------------------------------
+    let title_entry = gtk::Entry::builder()
+        .placeholder_text("Untitled")
+        .has_frame(false)
+        .margin_start(22)
+        .margin_end(24)
+        .margin_top(14)
+        .build();
+    title_entry.add_css_class("oma-title");
+
+    let body_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::Word)
         .left_margin(24)
         .right_margin(24)
-        .top_margin(18)
+        .top_margin(10)
         .bottom_margin(18)
         .pixels_below_lines(4)
         .build();
-    body.add_css_class("oma-body");
-    let buffer = body.buffer();
+    body_view.add_css_class("oma-body");
+    let buffer = body_view.buffer();
     buffer.set_enable_undo(true);
 
     let body_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&body)
+        .vexpand(true)
+        .child(&body_view)
         .build();
+
+    let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    right.append(&title_entry);
+    right.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    right.append(&body_scroll);
 
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .start_child(&outline_scroll)
-        .end_child(&body_scroll)
+        .end_child(&right)
         .resize_start_child(false)
         .shrink_start_child(false)
         .shrink_end_child(false)
         .position(wstate.paned.unwrap_or(320))
         .build();
 
+    let new_from_empty = gtk::Button::with_label("New outline");
+    new_from_empty.add_css_class("suggested-action");
+    new_from_empty.add_css_class("pill");
+    new_from_empty.set_halign(gtk::Align::Center);
     let empty = adw::StatusPage::builder()
         .icon_name("view-list-symbolic")
         .title("No outline open")
-        .description("Choose a book from the sidebar, or pass a file: omaverse path/to/romans.md")
+        .description("Create one, pick a book from the sidebar, or pass a file on the command line.")
+        .child(&new_from_empty)
         .build();
 
     let stack = gtk::Stack::new();
@@ -161,10 +196,13 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&libbox)
         .build();
-    let sidebar = adw::ToolbarView::new();
+    let new_btn = gtk::Button::from_icon_name("list-add-symbolic");
+    new_btn.set_tooltip_text(Some("New outline (Ctrl+N)"));
     let sb_header = adw::HeaderBar::new();
     sb_header.set_title_widget(Some(&adw::WindowTitle::new("Outlines", "")));
     sb_header.set_show_end_title_buttons(false);
+    sb_header.pack_end(&new_btn);
+    let sidebar = adw::ToolbarView::new();
     sidebar.add_top_bar(&sb_header);
     sidebar.set_content(Some(&lib_scroll));
 
@@ -205,6 +243,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
         path: RefCell::new(None),
         dstate: RefCell::new(DocState::default()),
         selected: RefCell::new(None),
+        pending_title: RefCell::new(None),
         dirty_doc: Cell::new(false),
         dirty_state: Cell::new(false),
         loading: Cell::new(false),
@@ -216,7 +255,9 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
         root_store,
         tree,
         selection: selection.clone(),
-        list,
+        list: list.clone(),
+        title_entry: title_entry.clone(),
+        body_view: body_view.clone(),
         buffer: buffer.clone(),
         libbox: libbox.clone(),
         lib_paths: RefCell::new(Vec::new()),
@@ -226,24 +267,47 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
     // That cycle is never collected, but App lives for the whole process, so the
     // alternative (threading Weak through every handler) buys nothing here.
     {
-        let app2 = app.clone();
-        factory.connect_bind(move |_, item| app2.bind_row(item));
+        let a = app.clone();
+        factory.connect_bind(move |_, item| a.bind_row(item));
     }
     {
-        let app2 = app.clone();
-        selection.connect_selected_notify(move |_| app2.on_selection_changed());
+        let a = app.clone();
+        selection.connect_selected_notify(move |_| a.on_selection_changed());
     }
     {
-        let app2 = app.clone();
+        let a = app.clone();
         buffer.connect_changed(move |_| {
-            if !app2.loading.get() {
-                app2.dirty_doc.set(true);
+            if !a.loading.get() {
+                a.dirty_doc.set(true);
             }
         });
     }
     {
-        let app2 = app.clone();
-        libbox.connect_row_activated(move |_, row| app2.on_library_activated(row));
+        let a = app.clone();
+        title_entry.connect_changed(move |e| {
+            if a.loading.get() {
+                return;
+            }
+            *a.pending_title.borrow_mut() = Some(e.text().to_string());
+            a.dirty_doc.set(true);
+        });
+    }
+    {
+        // Enter in the title drops into the body, which is the order you write in.
+        let a = app.clone();
+        title_entry.connect_activate(move |_| a.focus_body());
+    }
+    {
+        let a = app.clone();
+        libbox.connect_row_activated(move |_, row| a.on_library_activated(row));
+    }
+    {
+        let a = app.clone();
+        new_btn.connect_clicked(move |_| a.new_outline());
+    }
+    {
+        let a = app.clone();
+        new_from_empty.connect_clicked(move |_| a.new_outline());
     }
     {
         let s = split.clone();
@@ -254,72 +318,130 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
         split.connect_show_sidebar_notify(move |s| b.set_active(s.shows_sidebar()));
     }
 
-    // Actions + accelerators
-    let save = gio::SimpleAction::new("save", None);
+    // ---- keys in the outline pane -----------------------------------------
     {
-        let app2 = app.clone();
-        save.connect_activate(move |_, _| {
-            app2.flush_body();
-            app2.save_doc();
-            app2.dirty_doc.set(false);
+        let a = app.clone();
+        let kc = gtk::EventControllerKey::new();
+        kc.connect_key_pressed(move |_, key, _, state| {
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let alt = state.contains(gdk::ModifierType::ALT_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            let enter = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
+
+            let cmd = if enter && ctrl {
+                a.focus_body();
+                return glib::Propagation::Stop;
+            } else if enter {
+                Cmd::NewSiblingBelow
+            } else if key == gdk::Key::ISO_Left_Tab || (key == gdk::Key::Tab && shift) {
+                Cmd::Outdent
+            } else if key == gdk::Key::Tab {
+                Cmd::Indent
+            } else if key == gdk::Key::Up && alt {
+                Cmd::MoveUp
+            } else if key == gdk::Key::Down && alt {
+                Cmd::MoveDown
+            } else if key == gdk::Key::Delete {
+                Cmd::Delete
+            } else if key == gdk::Key::F2 {
+                a.focus_title();
+                return glib::Propagation::Stop;
+            } else {
+                return glib::Propagation::Proceed;
+            };
+            a.apply_cmd(cmd);
+            glib::Propagation::Stop
         });
+        list.add_controller(kc);
     }
-    window.add_action(&save);
-    let toggle = gio::SimpleAction::new("toggle-sidebar", None);
+    // Ctrl+Enter from the body goes back to the title.
     {
-        let s = split.clone();
-        toggle.connect_activate(move |_, _| s.set_show_sidebar(!s.shows_sidebar()));
+        let a = app.clone();
+        let kc = gtk::EventControllerKey::new();
+        kc.connect_key_pressed(move |_, key, _, state| {
+            let enter = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
+            if enter && state.contains(gdk::ModifierType::CONTROL_MASK) {
+                a.focus_title();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        body_view.add_controller(kc);
     }
-    window.add_action(&toggle);
+
+    // ---- actions -----------------------------------------------------------
+    add_action(&window, "save", {
+        let a = app.clone();
+        move || {
+            a.commit_pending();
+            a.save_doc();
+            a.dirty_doc.set(false);
+        }
+    });
+    add_action(&window, "toggle-sidebar", {
+        let s = split.clone();
+        move || s.set_show_sidebar(!s.shows_sidebar())
+    });
+    add_action(&window, "new-outline", {
+        let a = app.clone();
+        move || a.new_outline()
+    });
     gapp.set_accels_for_action("win.save", &["<Primary>s"]);
     gapp.set_accels_for_action("win.toggle-sidebar", &["<Primary>backslash"]);
+    gapp.set_accels_for_action("win.new-outline", &["<Primary>n"]);
 
     // Periodic flushers. Polling a dirty flag avoids the cancellation bugs that
     // come with rescheduling a timer on every keystroke.
     {
-        let app2 = app.clone();
+        let a = app.clone();
         glib::timeout_add_local(Duration::from_millis(SAVE_DOC_MS), move || {
-            if app2.dirty_doc.get() {
-                app2.flush_body();
-                app2.save_doc();
-                app2.dirty_doc.set(false);
+            if a.dirty_doc.get() {
+                a.commit_pending();
+                a.save_doc();
+                a.dirty_doc.set(false);
             }
             glib::ControlFlow::Continue
         });
     }
     {
-        let app2 = app.clone();
+        let a = app.clone();
         glib::timeout_add_local(Duration::from_millis(SAVE_STATE_MS), move || {
-            if app2.dirty_state.get() {
-                app2.save_state();
-                app2.dirty_state.set(false);
+            if a.dirty_state.get() {
+                a.save_state();
+                a.dirty_state.set(false);
             }
             glib::ControlFlow::Continue
         });
     }
     {
-        let app2 = app.clone();
+        let a = app.clone();
         window.connect_close_request(move |_| {
-            app2.flush_body();
-            app2.save_doc();
-            app2.save_state();
-            app2.save_window_state();
+            a.commit_pending();
+            a.save_doc();
+            a.save_state();
+            a.save_window_state();
             glib::Propagation::Proceed
         });
     }
 
     app.refresh_library();
-    let initial = cli.or(wstate.last_file);
-    if let Some(p) = initial.filter(|p| p.exists()) {
+    if let Some(p) = cli.or(wstate.last_file).filter(|p| p.exists()) {
         app.open(&p);
     }
     window.present();
 }
 
+fn add_action(window: &adw::ApplicationWindow, name: &str, f: impl Fn() + 'static) {
+    let a = gio::SimpleAction::new(name, None);
+    a.connect_activate(move |_, _| f());
+    window.add_action(&a);
+}
+
 fn load_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(CSS);
-    if let Some(display) = gtk::gdk::Display::default() {
+    if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,
@@ -339,14 +461,16 @@ impl App {
         let Some(label) = expander.child().and_downcast::<gtk::Label>() else { return };
 
         expander.set_list_row(Some(&row));
-        let t = obj.title();
-        if t.trim().is_empty() {
-            label.set_text("Untitled");
-            label.add_css_class("oma-untitled");
-        } else {
-            label.set_text(&t);
-            label.remove_css_class("oma-untitled");
-        }
+        label.set_text(&obj.display_title());
+
+        // Mirror later renames onto the label without rebuilding the tree.
+        let binding = obj
+            .bind_property("title", &label, "label")
+            .transform_to(|_, t: String| {
+                Some(if t.trim().is_empty() { "Untitled".to_string() } else { t })
+            })
+            .build();
+        unsafe { item.set_data("oma-title-binding", binding) };
 
         // Watch fold state once per row. The handler dies with the row, so
         // there is nothing to disconnect on unbind.
@@ -362,62 +486,196 @@ impl App {
     fn on_row_expanded(&self, row: &gtk::TreeListRow) {
         let Some(obj) = row.item().and_downcast::<NodeObject>() else { return };
         let key = path_key(&obj.path());
-        let mut st = self.dstate.borrow_mut();
-        if row.is_expanded() {
-            st.collapsed.remove(&key);
-        } else {
-            st.collapsed.insert(key);
+        {
+            let mut st = self.dstate.borrow_mut();
+            if row.is_expanded() {
+                st.collapsed.remove(&key);
+            } else {
+                st.collapsed.insert(key);
+            }
         }
-        drop(st);
         self.dirty_state.set(true);
     }
 
-    // ---- selection / body --------------------------------------------------
+    // ---- editing -----------------------------------------------------------
+
+    fn apply_cmd(self: &Rc<Self>, cmd: Cmd) {
+        // Anything typed but not yet in the model must land first, or the
+        // command would operate on stale text.
+        self.commit_pending();
+        let at = self.selected.borrow().clone();
+        if cmd.is_destructive() && self.needs_confirmation(at.as_deref()) {
+            self.confirm_delete(at);
+            return;
+        }
+        self.run(cmd, at);
+    }
+
+    fn run(&self, cmd: Cmd, at: Option<NodePath>) {
+        let outcome = {
+            let mut d = self.doc.borrow_mut();
+            edit::apply(&mut d, at.as_deref(), cmd)
+        };
+        let Some(out) = outcome else { return };
+        self.dirty_doc.set(true);
+        if out.structural {
+            self.rebuild_tree();
+        }
+        match out.select {
+            Some(p) => {
+                self.select_path(&p);
+                if out.focus_title {
+                    self.focus_title();
+                }
+            }
+            None => {
+                // Never leave the document with nowhere to type.
+                let p = self.doc.borrow_mut().push_root(Node::new(""));
+                self.rebuild_tree();
+                self.select_path(&p);
+                self.focus_title();
+            }
+        }
+    }
+
+    fn needs_confirmation(&self, at: Option<&[usize]>) -> bool {
+        let Some(p) = at else { return false };
+        let d = self.doc.borrow();
+        d.get(p)
+            .map(|n| !n.children.is_empty() || !n.body.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    fn confirm_delete(self: &Rc<Self>, at: Option<NodePath>) {
+        let Some(p) = at.clone() else { return };
+        let (title, kids, has_body) = {
+            let d = self.doc.borrow();
+            match d.get(&p) {
+                Some(n) => (
+                    n.title.trim().to_string(),
+                    count_descendants(n),
+                    !n.body.trim().is_empty(),
+                ),
+                None => return,
+            }
+        };
+        let heading = if title.is_empty() {
+            "Delete this untitled node?".to_string()
+        } else {
+            format!("Delete \u{201c}{title}\u{201d}?")
+        };
+        let mut detail = String::new();
+        if kids > 0 {
+            detail.push_str(&format!(
+                "{kids} node{} beneath it will go too",
+                if kids == 1 { "" } else { "s" }
+            ));
+        }
+        if has_body {
+            if !detail.is_empty() {
+                detail.push_str(", and ");
+            }
+            detail.push_str("its notes will be deleted");
+        }
+        if detail.is_empty() {
+            detail.push_str("This cannot be undone");
+        }
+        detail.push('.');
+
+        let dlg = adw::AlertDialog::new(Some(&heading), Some(&detail));
+        dlg.add_response("cancel", "Cancel");
+        dlg.add_response("delete", "Delete");
+        dlg.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dlg.set_default_response(Some("cancel"));
+        dlg.set_close_response("cancel");
+        let me = self.clone();
+        dlg.connect_response(None, move |_, resp| {
+            if resp == "delete" {
+                me.run(Cmd::Delete, at.clone());
+            }
+        });
+        dlg.present(Some(&self.window));
+    }
+
+    /// Push the title the user has typed into the model, and the body with it.
+    fn commit_pending(&self) {
+        let pending = self.pending_title.borrow_mut().take();
+        if let (Some(t), Some(p)) = (pending, self.selected.borrow().clone()) {
+            let changed = {
+                let mut d = self.doc.borrow_mut();
+                edit::apply(&mut d, Some(&p), Cmd::SetTitle(t.clone())).is_some()
+            };
+            if changed {
+                self.update_row_title(&p, &t);
+            }
+        }
+        self.flush_body();
+    }
+
+    fn update_row_title(&self, path: &[usize], title: &str) {
+        if let Some(i) = self.find_row(path) {
+            if let Some(obj) = self.tree.row(i).and_then(|r| r.item()).and_downcast::<NodeObject>() {
+                obj.set_title(title);
+            }
+        }
+    }
+
+    fn focus_title(&self) {
+        self.title_entry.grab_focus();
+    }
+
+    fn focus_body(&self) {
+        self.body_view.grab_focus();
+    }
+
+    // ---- selection / editors ----------------------------------------------
 
     fn current_selection_path(&self) -> Option<NodePath> {
-        let item = self.selection.selected_item()?;
-        let row = item.downcast::<gtk::TreeListRow>().ok()?;
-        let obj = row.item().and_downcast::<NodeObject>()?;
-        Some(obj.path())
+        let row = self.selection.selected_item()?.downcast::<gtk::TreeListRow>().ok()?;
+        Some(row.item().and_downcast::<NodeObject>()?.path())
     }
 
     fn on_selection_changed(&self) {
         if self.loading.get() {
             return;
         }
-        self.flush_body();
+        self.commit_pending();
         let new = self.current_selection_path();
         *self.selected.borrow_mut() = new.clone();
-        match new {
-            Some(p) => {
-                self.load_body(&p);
-                let key = path_key(&p);
-                self.dstate.borrow_mut().selected = Some(key);
-                self.dirty_state.set(true);
-            }
-            None => self.load_text(""),
+        self.load_node(new.as_deref());
+        if let Some(p) = new {
+            self.dstate.borrow_mut().selected = Some(path_key(&p));
+            self.dirty_state.set(true);
         }
     }
 
-    fn load_text(&self, text: &str) {
+    /// Fill the title entry and body editor from the model.
+    fn load_node(&self, path: Option<&[usize]>) {
+        let (title, body) = match path {
+            Some(p) => self
+                .doc
+                .borrow()
+                .get(p)
+                .map(|n| (n.title.clone(), n.body.clone()))
+                .unwrap_or_default(),
+            None => (String::new(), String::new()),
+        };
         self.loading.set(true);
-        self.buffer.set_text(text);
+        self.title_entry.set_text(&title);
+        self.title_entry.set_sensitive(path.is_some());
+        self.buffer.set_text(&body);
+        // Undo history must not cross from one node into another.
         self.buffer.set_enable_undo(false);
-        self.buffer.set_enable_undo(true); // drop undo history across documents
+        self.buffer.set_enable_undo(true);
         self.loading.set(false);
-    }
-
-    fn load_body(&self, path: &[usize]) {
-        let text = self.doc.borrow().get(path).map(|n| n.body.clone()).unwrap_or_default();
-        self.load_text(&text);
+        self.pending_title.borrow_mut().take();
     }
 
     /// Copy the editor's contents back into the selected node.
     fn flush_body(&self) {
         let Some(p) = self.selected.borrow().clone() else { return };
         let (s, e) = self.buffer.bounds();
-        let text = self.buffer.text(&s, &e, false).to_string();
-        let new = text.trim_end().to_string();
+        let new = self.buffer.text(&s, &e, false).to_string().trim_end().to_string();
         let mut d = self.doc.borrow_mut();
         if let Some(n) = d.get_mut(&p) {
             if n.body != new {
@@ -429,9 +687,8 @@ impl App {
     // ---- documents ---------------------------------------------------------
 
     pub fn open(&self, path: &PathBuf) {
-        // Leaving the previous document: make sure nothing is left unsaved.
         if self.path.borrow().is_some() {
-            self.flush_body();
+            self.commit_pending();
             self.save_doc();
             self.save_state();
             self.dirty_doc.set(false);
@@ -443,35 +700,83 @@ impl App {
         *self.path.borrow_mut() = Some(path.clone());
         *self.dstate.borrow_mut() = state::load_doc_state(path);
         *self.selected.borrow_mut() = None;
+        self.pending_title.borrow_mut().take();
 
-        let title = self
-            .doc
-            .borrow()
-            .title
-            .clone()
-            .unwrap_or_else(|| library::title_of(path));
+        let title = self.doc.borrow().title.clone().unwrap_or_else(|| library::title_of(path));
         self.wtitle.set_title(&title);
-        self.wtitle.set_subtitle(&self.pretty_location(path));
+        self.wtitle.set_subtitle(&self.pretty(path));
+        self.wtitle.remove_css_class("oma-error");
         self.window.set_title(Some(&format!("{title} — omaverse")));
         self.stack.set_visible_child_name("doc");
 
         self.rebuild_tree();
 
-        // Restore the remembered selection, else the first node.
-        let want = self.dstate.borrow().selected.clone().and_then(|k| parse_path_key(&k));
-        let target = want.filter(|p| self.doc.borrow().get(p).is_some());
-        if let Some(p) = target {
-            self.select_path(&p);
-        } else if !self.doc.borrow().is_empty() {
-            self.select_path(&[0]);
-        } else {
-            self.load_text("");
+        let remembered = self
+            .dstate
+            .borrow()
+            .selected
+            .clone()
+            .and_then(|k| parse_path_key(&k))
+            .filter(|p| self.doc.borrow().get(p).is_some());
+        match remembered {
+            Some(p) => self.select_path(&p),
+            None if !self.doc.borrow().is_empty() => self.select_path(&[0]),
+            None => self.load_node(None),
         }
     }
 
-    fn pretty_location(&self, path: &std::path::Path) -> String {
-        let home = state::home();
-        match path.strip_prefix(&home) {
+    fn new_outline(self: &Rc<Self>) {
+        let entry = gtk::Entry::builder()
+            .placeholder_text("e.g. Romans")
+            .activates_default(true)
+            .build();
+        let dlg = adw::AlertDialog::new(
+            Some("New outline"),
+            Some(&format!("Created in {}", self.pretty(&self.cfg.outline_dir))),
+        );
+        dlg.set_extra_child(Some(&entry));
+        dlg.add_response("cancel", "Cancel");
+        dlg.add_response("create", "Create");
+        dlg.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+        dlg.set_default_response(Some("create"));
+        dlg.set_close_response("cancel");
+        let me = self.clone();
+        dlg.connect_response(None, move |_, resp| {
+            if resp != "create" {
+                return;
+            }
+            let name = entry.text().to_string().trim().to_string();
+            if !name.is_empty() {
+                me.create_outline(&name);
+            }
+        });
+        dlg.present(Some(&self.window));
+    }
+
+    fn create_outline(&self, name: &str) {
+        let safe: String = name
+            .chars()
+            .map(|c| if std::path::is_separator(c) || c == ':' { '-' } else { c })
+            .collect();
+        let path = self.cfg.outline_dir.join(format!("{safe}.md"));
+        if !path.exists() {
+            let mut d = Document::default();
+            d.title = Some(name.to_string());
+            d.push_root(Node::new(""));
+            if let Err(e) = crate::atomic_write(&path, parse::serialize(&d).as_bytes()) {
+                eprintln!("omaverse: could not create {}: {e}", path.display());
+                self.wtitle.set_subtitle(&format!("Could not create outline — {e}"));
+                self.wtitle.add_css_class("oma-error");
+                return;
+            }
+        }
+        self.refresh_library();
+        self.open(&path);
+        self.focus_title();
+    }
+
+    fn pretty(&self, path: &std::path::Path) -> String {
+        match path.strip_prefix(state::home()) {
             Ok(rest) => format!("~/{}", rest.display()),
             Err(_) => path.display().to_string(),
         }
@@ -483,7 +788,8 @@ impl App {
         {
             let d = self.doc.borrow();
             for (i, n) in d.roots.iter().enumerate() {
-                self.root_store.append(&NodeObject::new(vec![i], &n.title, !n.children.is_empty()));
+                self.root_store
+                    .append(&NodeObject::new(vec![i], &n.title, !n.children.is_empty()));
             }
         }
         self.apply_expansion();
@@ -491,8 +797,7 @@ impl App {
     }
 
     /// Expand every row not listed as collapsed. Expanding a row inserts its
-    /// children immediately after it, so a single forward pass reaches the whole
-    /// visible tree.
+    /// children immediately after it, so one forward pass reaches the whole tree.
     fn apply_expansion(&self) {
         let collapsed = self.dstate.borrow().collapsed.clone();
         let mut i = 0;
@@ -512,24 +817,22 @@ impl App {
     }
 
     fn find_row(&self, path: &[usize]) -> Option<u32> {
-        for i in 0..self.tree.n_items() {
-            let row = self.tree.row(i)?;
-            let obj = row.item().and_downcast::<NodeObject>()?;
-            if obj.path() == path {
-                return Some(i);
-            }
-        }
-        None
+        (0..self.tree.n_items()).find(|&i| {
+            self.tree
+                .row(i)
+                .and_then(|r| r.item())
+                .and_downcast::<NodeObject>()
+                .map(|o| o.path() == path)
+                .unwrap_or(false)
+        })
     }
 
     fn select_path(&self, path: &[usize]) {
-        // Make sure every ancestor is open, or the row will not exist yet.
+        // Every ancestor must be open, or the row does not exist yet.
         for depth in 1..path.len() {
-            if let Some(i) = self.find_row(&path[..depth]) {
-                if let Some(row) = self.tree.row(i) {
-                    if row.is_expandable() && !row.is_expanded() {
-                        row.set_expanded(true);
-                    }
+            if let Some(row) = self.find_row(&path[..depth]).and_then(|i| self.tree.row(i)) {
+                if row.is_expandable() && !row.is_expanded() {
+                    row.set_expanded(true);
                 }
             }
         }
@@ -538,11 +841,11 @@ impl App {
             self.selection.set_selected(i);
             *self.selected.borrow_mut() = Some(path.to_vec());
             self.loading.set(false);
-            self.load_body(path);
+            self.load_node(Some(path));
             self.list.scroll_to(i, gtk::ListScrollFlags::NONE, None);
             // `loading` suppresses on_selection_changed, so record the selection
-            // here too -- otherwise the initial selection is never persisted and
-            // reopening always lands on the first node.
+            // here too -- otherwise it is never persisted and reopening always
+            // lands on the first node.
             self.dstate.borrow_mut().selected = Some(path_key(path));
             self.dirty_state.set(true);
         }
@@ -558,51 +861,32 @@ impl App {
         let groups = library::scan(&self.cfg.outline_dir);
 
         if groups.is_empty() {
-            let l = gtk::Label::new(Some(&format!(
-                "No outlines in\n{}",
-                self.pretty_location(&self.cfg.outline_dir)
-            )));
-            l.set_wrap(true);
-            l.set_xalign(0.0);
-            l.set_margin_start(12);
-            l.set_margin_end(12);
-            l.set_margin_top(12);
-            l.add_css_class("dim-label");
-            let row = gtk::ListBoxRow::new();
-            row.set_child(Some(&l));
-            row.set_selectable(false);
-            row.set_activatable(false);
-            self.libbox.append(&row);
             paths.push(None);
+            self.libbox.append(&plain_row(
+                &format!("No outlines in\n{}", self.pretty(&self.cfg.outline_dir)),
+                &["dim-label"],
+                true,
+            ));
         }
-
         for g in groups {
             if let Some(name) = &g.name {
-                let l = gtk::Label::new(Some(&name.to_uppercase()));
-                l.set_xalign(0.0);
-                l.set_margin_start(12);
-                l.set_margin_top(10);
-                l.set_margin_bottom(2);
-                l.add_css_class("oma-group");
-                let row = gtk::ListBoxRow::new();
-                row.set_child(Some(&l));
-                row.set_selectable(false);
-                row.set_activatable(false);
-                self.libbox.append(&row);
                 paths.push(None);
+                self.libbox.append(&plain_row(&name.to_uppercase(), &["oma-group"], false));
             }
             for e in &g.entries {
-                let l = gtk::Label::new(Some(&e.title));
-                l.set_xalign(0.0);
-                l.set_ellipsize(pango::EllipsizeMode::End);
-                l.set_margin_start(12);
-                l.set_margin_end(12);
-                l.set_margin_top(6);
-                l.set_margin_bottom(6);
-                let row = gtk::ListBoxRow::new();
-                row.set_child(Some(&l));
-                self.libbox.append(&row);
                 paths.push(Some(e.path.clone()));
+                let label = gtk::Label::builder()
+                    .label(&e.title)
+                    .xalign(0.0)
+                    .ellipsize(pango::EllipsizeMode::End)
+                    .margin_start(12)
+                    .margin_end(12)
+                    .margin_top(6)
+                    .margin_bottom(6)
+                    .build();
+                let row = gtk::ListBoxRow::new();
+                row.set_child(Some(&label));
+                self.libbox.append(&row);
             }
         }
         *self.lib_paths.borrow_mut() = paths;
@@ -613,8 +897,7 @@ impl App {
         if idx < 0 {
             return;
         }
-        let path = self.lib_paths.borrow().get(idx as usize).cloned().flatten();
-        if let Some(p) = path {
+        if let Some(p) = self.lib_paths.borrow().get(idx as usize).cloned().flatten() {
             self.open(&p);
         }
     }
@@ -626,7 +909,7 @@ impl App {
         let text = parse::serialize(&self.doc.borrow());
         match crate::atomic_write(&path, text.as_bytes()) {
             Ok(()) => {
-                self.wtitle.set_subtitle(&self.pretty_location(&path));
+                self.wtitle.set_subtitle(&self.pretty(&path));
                 self.wtitle.remove_css_class("oma-error");
             }
             Err(e) => {
@@ -653,4 +936,28 @@ impl App {
             last_file: self.path.borrow().clone(),
         });
     }
+}
+
+fn plain_row(text: &str, classes: &[&str], wrap: bool) -> gtk::ListBoxRow {
+    let label = gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .wrap(wrap)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(10)
+        .margin_bottom(2)
+        .build();
+    for c in classes {
+        label.add_css_class(c);
+    }
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&label));
+    row.set_selectable(false);
+    row.set_activatable(false);
+    row
+}
+
+fn count_descendants(n: &Node) -> usize {
+    n.children.len() + n.children.iter().map(count_descendants).sum::<usize>()
 }
