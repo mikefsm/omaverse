@@ -332,6 +332,47 @@ mod tests {
         assert_eq!(parse("-\n").roots[0].title, "");
     }
 
+    /// Deleting a section's heading line should fold its text up into the
+    /// section above -- that is how you merge two sections by hand.
+    #[test]
+    fn deleting_a_heading_merges_its_text_into_the_section_above() {
+        let before = "\
+- Part One — 1:1
+
+  1:1 In the beginning, God created the heavens and the earth.
+
+- Part Two — 1:2
+
+  2 The earth was without form and void.
+";
+        // the user deletes the "- Part Two — 1:2" line
+        let after = "\
+- Part One — 1:1
+
+  1:1 In the beginning, God created the heavens and the earth.
+
+  2 The earth was without form and void.
+";
+        let d = parse(after);
+        assert_eq!(d.roots.len(), 1, "one section now, not two");
+        assert_eq!(d.roots[0].title, "Part One — 1:1");
+        assert_eq!(
+            d.roots[0].body,
+            "1:1 In the beginning, God created the heavens and the earth.\n\n\
+             2 The earth was without form and void."
+        );
+        assert_eq!(parse(before).roots.len(), 2, "two sections beforehand");
+    }
+
+    /// The same merge when the deleted section was indented deeper: its text
+    /// keeps its own relative indentation rather than being flattened.
+    #[test]
+    fn merging_a_deeper_section_keeps_relative_indentation() {
+        let d = parse("- A\n\n  text of A\n\n    text that was under B\n");
+        assert_eq!(d.roots.len(), 1);
+        assert_eq!(d.roots[0].body, "text of A\n\n  text that was under B");
+    }
+
     #[test]
     fn empty_input_produces_empty_output() {
         let d = parse("");
