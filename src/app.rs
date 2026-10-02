@@ -108,6 +108,8 @@ pub struct App {
     note_open: Cell<bool>,
     /// The fold triangles drawn beside the text.
     gutter: RefCell<Option<gtk::DrawingArea>>,
+    /// Shown only while an interlinear is open.
+    to_diagram: gtk::Button,
     toasts: adw::ToastOverlay,
     /// The undo offer for the last removed word. Only the most recent removal
     /// can be taken back: an older offer would put its word back at an index
@@ -294,6 +296,12 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         .active(split.shows_sidebar())
         .build();
     header.pack_start(&sb_toggle);
+    // Making a diagram is about the sheet you are looking at, so it belongs
+    // here rather than only in the sidebar's "new document" menu.
+    let to_diagram = gtk::Button::with_label("Diagram");
+    to_diagram.set_tooltip_text(Some("Start a diagram from this interlinear"));
+    to_diagram.set_visible(false);
+    header.pack_end(&to_diagram);
 
     let shell = adw::ToolbarView::new();
     shell.add_top_bar(&header);
@@ -339,6 +347,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         buffer: buffer.clone(),
         libbox: libbox.clone(),
         toasts: toasts.clone(),
+        to_diagram: to_diagram.clone(),
         last_removal: RefCell::new(None),
         lib_paths: RefCell::new(Vec::new()),
         recent: RefCell::new(wstate.recent.clone()),
@@ -625,6 +634,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         let a = app.clone();
         move || a.make_diagram()
     });
+    {
+        let a = app.clone();
+        to_diagram.connect_clicked(move |_| a.make_diagram());
+    }
     add_action(&window, "open-outline", {
         let a = app.clone();
         move || a.open_dialog()
@@ -2081,6 +2094,7 @@ impl App {
         let src = std::fs::read_to_string(path).unwrap_or_default();
         *self.sheet.borrow_mut() = None;
         self.canvas.clear();
+        self.to_diagram.set_visible(false);
         *self.path.borrow_mut() = Some(path.clone());
         *self.dstate.borrow_mut() = state::load_doc_state(path);
         *self.selected.borrow_mut() = None;
@@ -2743,6 +2757,7 @@ impl App {
             }
         };
         *self.sheet.borrow_mut() = None;
+        self.to_diagram.set_visible(false);
         *self.path.borrow_mut() = Some(path.clone());
         self.record_stamp(path);
         self.conflict.set(false);
@@ -2809,6 +2824,7 @@ impl App {
         self.canvas.clear();
         self.grid.show(&sheet);
         *self.sheet.borrow_mut() = Some(sheet);
+        self.to_diagram.set_visible(true);
         self.stack.set_visible_child_name("interlinear");
         self.split.set_show_sidebar(true);
 
