@@ -744,13 +744,20 @@ impl App {
     fn apply_folds(&self) {
         self.unfold_all();
 
+        // Only sections with children may fold. The outline shows a disclosure
+        // triangle only for those, so folding anything else would hide its text
+        // with no way to get it back -- which is exactly what happened to a
+        // section holding a whole book and no subsections yet.
+        let doc = self.doc.borrow();
         let collapsed: Vec<NodePath> = self
             .dstate
             .borrow()
             .collapsed
             .iter()
             .filter_map(|k| parse_path_key(k))
+            .filter(|p| doc.get(p).map(|n| !n.children.is_empty()).unwrap_or(false))
             .collect();
+        drop(doc);
         let outermost: Vec<&NodePath> = collapsed
             .iter()
             .filter(|p| !collapsed.iter().any(|q| q.len() < p.len() && p.starts_with(q)))
@@ -786,6 +793,24 @@ impl App {
         self.buffer.end_irreversible_action();
         self.loading.set(false);
         docview::restyle(&self.buffer);
+    }
+
+    /// Drop fold state that no longer names a foldable section.
+    ///
+    /// Keys outlast the structure they described: edit a document until a
+    /// section loses its children and its stored "collapsed" would hide its
+    /// text for good, since there is no longer a triangle to reopen it.
+    fn prune_collapsed(&self) {
+        let doc = self.doc.borrow();
+        let before = self.dstate.borrow().collapsed.len();
+        self.dstate.borrow_mut().collapsed.retain(|k| {
+            parse_path_key(k)
+                .and_then(|p| doc.get(&p).map(|n| !n.children.is_empty()))
+                .unwrap_or(false)
+        });
+        if self.dstate.borrow().collapsed.len() != before {
+            self.dirty_state.set(true);
+        }
     }
 
     /// The whole file, with folded sections spliced back in. Everything that
@@ -834,6 +859,7 @@ impl App {
     fn refresh_structure(&self) {
         let text = self.full_text();
         *self.doc.borrow_mut() = parse::parse(&text);
+        self.prune_collapsed();
         self.rebuild_tree();
         self.apply_folds();
     }
@@ -1140,6 +1166,7 @@ impl App {
         *self.selected.borrow_mut() = None;
         self.set_text(&src);
         *self.doc.borrow_mut() = parse::parse(&src);
+        self.prune_collapsed();
 
         let title = self.doc.borrow().title.clone().unwrap_or_else(|| library::title_of(path));
         self.wtitle.set_title(&title);
