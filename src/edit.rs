@@ -8,6 +8,9 @@
 use crate::model::{Document, Node, NodePath};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+// MoveTo is unused while dragging is out; it and its tests are kept so the
+// gesture can come back without reinventing the index arithmetic.
+#[allow(dead_code)]
 pub enum Cmd {
     /// Insert an empty sibling directly below. With no selection, appends a root.
     NewSiblingBelow,
