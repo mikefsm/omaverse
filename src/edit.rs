@@ -19,7 +19,6 @@ pub enum Cmd {
     MoveDown,
     /// Remove the node and everything under it.
     Delete,
-    SetTitle(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,15 +69,6 @@ pub fn apply(doc: &mut Document, at: Option<&[usize]>, cmd: Cmd) -> Option<Outco
             let path = at?;
             doc.remove(path)?;
             Some(Outcome { select: after_delete(doc, path), structural: true, focus_title: false })
-        }
-        Cmd::SetTitle(t) => {
-            let path = at?;
-            let node = doc.get_mut(path)?;
-            if node.title == t {
-                return None;
-            }
-            node.title = t;
-            Some(Outcome { select: Some(path.to_vec()), structural: false, focus_title: false })
         }
     }
 }
@@ -219,18 +209,6 @@ mod tests {
         assert!(Cmd::Delete.is_destructive());
         assert!(!Cmd::Indent.is_destructive());
         assert!(!Cmd::NewSiblingBelow.is_destructive());
-    }
-
-    #[test]
-    fn set_title_is_not_structural_and_ignores_no_op_edits() {
-        let mut d = fixture();
-        let o = apply(&mut d, Some(&[0]), Cmd::SetTitle("Introduction".into())).unwrap();
-        assert!(!o.structural);
-        assert_eq!(d.get(&[0]).unwrap().title, "Introduction");
-        assert!(
-            apply(&mut d, Some(&[0]), Cmd::SetTitle("Introduction".into())).is_none(),
-            "an unchanged title should not mark the document dirty"
-        );
     }
 
     #[test]

@@ -1,13 +1,15 @@
-//! UI: library sidebar | outline tree | title + body editor.
+//! UI: library sidebar | outline navigation | the whole document.
 //!
-//! The `Document` is the single source of truth. All structural editing goes
-//! through `edit::apply`, which is pure and unit-tested; the handlers here only
-//! translate a keystroke into a `Cmd` and apply the resulting `Outcome`.
+//! The text buffer holds the file verbatim and is the single source of truth.
+//! The outline tree is derived from it: a table of contents you navigate and
+//! fold with, not a separate thing to keep in sync. Appearance is all tags, so
+//! what is saved is exactly what was typed.
 
 use crate::config::{self, Config};
+use crate::docview;
 use crate::edit::{self, Cmd};
 use crate::library;
-use crate::model::{parse_path_key, path_key, Document, Node, NodePath};
+use crate::model::{parse_path_key, path_key, Document, NodePath};
 use crate::nodeobj::NodeObject;
 use crate::parse;
 use crate::state::{self, DocState};
@@ -26,13 +28,12 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
+const STYLE_MS: u64 = 200;
 const SAVE_DOC_MS: u64 = 800;
 const SAVE_STATE_MS: u64 = 2000;
 
 const CSS: &str = "
-.oma-body { font-family: 'Source Serif 4','Noto Serif','DejaVu Serif',serif; font-size: 12.5pt; }
-.oma-title { font-family: 'Source Serif 4','Noto Serif','DejaVu Serif',serif; font-size: 17pt; font-weight: 600; }
-.oma-title:disabled { opacity: 0.3; }
+.oma-doc { font-family: 'Source Serif 4','Noto Serif','DejaVu Serif',serif; font-size: 12.5pt; }
 .oma-outline { font-size: 10.5pt; }
 .oma-group { font-size: 9pt; font-weight: bold; opacity: 0.55; }
 .oma-error { color: #e01b24; }
@@ -40,17 +41,18 @@ const CSS: &str = "
 
 pub struct App {
     cfg: Config,
+    /// Cache of the parsed buffer, refreshed on a debounce. The buffer, not
+    /// this, is authoritative.
     doc: Rc<RefCell<Document>>,
     path: RefCell<Option<PathBuf>>,
     dstate: RefCell<DocState>,
     selected: RefCell<Option<NodePath>>,
-    /// Title text typed but not yet pushed into the model.
-    pending_title: RefCell<Option<String>>,
 
     dirty_doc: Cell<bool>,
+    dirty_style: Cell<bool>,
     dirty_state: Cell<bool>,
-    /// Set while the app is driving the widgets, so their change signals don't
-    /// get mistaken for the user typing.
+    /// Set while the app drives the widgets, so their change signals are not
+    /// mistaken for the user typing.
     loading: Cell<bool>,
 
     window: adw::ApplicationWindow,
@@ -62,13 +64,10 @@ pub struct App {
     tree: gtk::TreeListModel,
     selection: gtk::SingleSelection,
     list: gtk::ListView,
-    title_entry: gtk::Entry,
-    body_view: gtk::TextView,
+    view: gtk::TextView,
     buffer: gtk::TextBuffer,
     libbox: gtk::ListBox,
     lib_paths: RefCell<Vec<Option<PathBuf>>>,
-    /// Outlines can be saved anywhere, so files outside `outline_dir` are kept
-    /// reachable through a Recent group in the sidebar.
     recent: RefCell<Vec<PathBuf>>,
 }
 
@@ -78,7 +77,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     let wstate = state::load_window_state();
     let doc: Rc<RefCell<Document>> = Rc::new(RefCell::new(Document::default()));
 
-    // ---- outline tree ------------------------------------------------------
+    // ---- outline navigation ------------------------------------------------
     let root_store = gio::ListStore::new::<NodeObject>();
     let tree = gtk::TreeListModel::new(root_store.clone(), false, false, {
         let doc = doc.clone();
@@ -115,7 +114,6 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         item.set_child(Some(&expander));
     });
     factory.connect_unbind(|_, item| {
-        // Drop the title binding, or a recycled row keeps mirroring the old node.
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else { return };
         unsafe {
             if let Some(b) = item.steal_data::<glib::Binding>("oma-title-binding") {
@@ -126,53 +124,38 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
 
     let list = gtk::ListView::new(Some(selection.clone()), Some(factory.clone()));
     list.add_css_class("oma-outline");
-
     let outline_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&list)
         .build();
 
-    // ---- title + body ------------------------------------------------------
-    let title_entry = gtk::Entry::builder()
-        .placeholder_text("Untitled")
-        .has_frame(false)
-        .margin_start(22)
-        .margin_end(24)
-        .margin_top(14)
-        .build();
-    title_entry.add_css_class("oma-title");
-
-    let body_view = gtk::TextView::builder()
+    // ---- the document ------------------------------------------------------
+    let view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::Word)
-        .left_margin(24)
-        .right_margin(24)
-        .top_margin(10)
-        .bottom_margin(18)
-        .pixels_below_lines(4)
+        .left_margin(12)
+        .right_margin(36)
+        .top_margin(16)
+        .bottom_margin(240) // room to scroll the last section up the page
         .build();
-    body_view.add_css_class("oma-body");
-    let buffer = body_view.buffer();
+    view.add_css_class("oma-doc");
+    let buffer = view.buffer();
     buffer.set_enable_undo(true);
+    docview::install_tags(&buffer);
 
-    let body_scroll = gtk::ScrolledWindow::builder()
+    let doc_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
-        .child(&body_view)
+        .child(&view)
         .build();
-
-    let right = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    right.append(&title_entry);
-    right.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    right.append(&body_scroll);
 
     let paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .start_child(&outline_scroll)
-        .end_child(&right)
+        .end_child(&doc_scroll)
         .resize_start_child(false)
         .shrink_start_child(false)
         .shrink_end_child(false)
-        .position(wstate.paned.unwrap_or(320))
+        .position(wstate.paned.unwrap_or(300))
         .build();
 
     let new_from_empty = gtk::Button::with_label("New outline");
@@ -249,8 +232,8 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         path: RefCell::new(None),
         dstate: RefCell::new(DocState::default()),
         selected: RefCell::new(None),
-        pending_title: RefCell::new(None),
         dirty_doc: Cell::new(false),
+        dirty_style: Cell::new(false),
         dirty_state: Cell::new(false),
         loading: Cell::new(false),
         window: window.clone(),
@@ -262,47 +245,40 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         tree,
         selection: selection.clone(),
         list: list.clone(),
-        title_entry: title_entry.clone(),
-        body_view: body_view.clone(),
+        view: view.clone(),
         buffer: buffer.clone(),
         libbox: libbox.clone(),
         lib_paths: RefCell::new(Vec::new()),
         recent: RefCell::new(wstate.recent.clone()),
     });
 
-    // Note: these closures hold a strong Rc to App, which also owns the widgets.
-    // That cycle is never collected, but App lives for the whole process, so the
-    // alternative (threading Weak through every handler) buys nothing here.
+    // These closures hold a strong Rc to App, which owns the widgets. The cycle
+    // is never collected, but App lives for the whole process.
     {
         let a = app.clone();
         factory.connect_bind(move |_, item| a.bind_row(item));
     }
     {
         let a = app.clone();
-        selection.connect_selected_notify(move |_| a.on_selection_changed());
+        selection.connect_selected_notify(move |_| a.on_outline_selected());
     }
     {
         let a = app.clone();
         buffer.connect_changed(move |_| {
             if !a.loading.get() {
                 a.dirty_doc.set(true);
+                a.dirty_style.set(true);
             }
         });
     }
     {
+        // Keep the outline highlight on whatever section the cursor is in.
         let a = app.clone();
-        title_entry.connect_changed(move |e| {
-            if a.loading.get() {
-                return;
+        buffer.connect_cursor_position_notify(move |_| {
+            if !a.loading.get() {
+                a.sync_outline_to_cursor();
             }
-            *a.pending_title.borrow_mut() = Some(e.text().to_string());
-            a.dirty_doc.set(true);
         });
-    }
-    {
-        // Enter in the title drops into the body, which is the order you write in.
-        let a = app.clone();
-        title_entry.connect_activate(move |_| a.focus_body());
     }
     {
         let a = app.clone();
@@ -339,11 +315,11 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
             let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
             let enter = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
 
-            let cmd = if enter && ctrl {
-                a.focus_body();
-                return glib::Propagation::Stop;
-            } else if enter {
+            let cmd = if enter && !ctrl {
                 Cmd::NewSiblingBelow
+            } else if enter || key == gdk::Key::F2 {
+                a.focus_document();
+                return glib::Propagation::Stop;
             } else if key == gdk::Key::ISO_Left_Tab || (key == gdk::Key::Tab && shift) {
                 Cmd::Outdent
             } else if key == gdk::Key::Tab {
@@ -360,49 +336,24 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
                 return glib::Propagation::Stop;
             } else if key == gdk::Key::Delete {
                 Cmd::Delete
-            } else if key == gdk::Key::F2 {
-                a.focus_title();
-                return glib::Propagation::Stop;
             } else {
                 return glib::Propagation::Proceed;
             };
             a.apply_cmd(cmd);
             glib::Propagation::Stop
         });
-        // Capture phase, on the scroller rather than the list: GtkListView
-        // consumes Return for row activation and GtkWindow claims Tab for focus
-        // movement, both before a bubble-phase controller on the list would see
-        // them. Keys this handler does not claim still fall through.
         kc.set_propagation_phase(gtk::PropagationPhase::Capture);
         outline_scroll.add_controller(kc);
     }
-    // Ctrl+Enter from the body goes back to the title.
+    // Ctrl+Enter and Escape move between the document and the outline.
     {
         let a = app.clone();
         let kc = gtk::EventControllerKey::new();
         kc.connect_key_pressed(move |_, key, _, state| {
             let enter = key == gdk::Key::Return || key == gdk::Key::KP_Enter;
-            if enter && state.contains(gdk::ModifierType::CONTROL_MASK) {
-                a.focus_title();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        });
-        // Same reasoning: GtkTextView would insert a newline for Ctrl+Enter.
-        kc.set_propagation_phase(gtk::PropagationPhase::Capture);
-        body_scroll.add_controller(kc);
-    }
-    // Escape goes back to the outline pane. Without it there is no way out of
-    // the title or body by keyboard once you are in them.
-    for widget in [
-        title_entry.clone().upcast::<gtk::Widget>(),
-        body_scroll.clone().upcast::<gtk::Widget>(),
-    ] {
-        let a = app.clone();
-        let kc = gtk::EventControllerKey::new();
-        kc.connect_key_pressed(move |_, key, _, _| {
-            if key == gdk::Key::Escape {
+            if (enter && state.contains(gdk::ModifierType::CONTROL_MASK))
+                || key == gdk::Key::Escape
+            {
                 a.focus_outline();
                 glib::Propagation::Stop
             } else {
@@ -410,14 +361,13 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
             }
         });
         kc.set_propagation_phase(gtk::PropagationPhase::Capture);
-        widget.add_controller(kc);
+        doc_scroll.add_controller(kc);
     }
 
     // ---- actions -----------------------------------------------------------
     add_action(&window, "save", {
         let a = app.clone();
         move || {
-            a.commit_pending();
             a.save_doc();
             a.dirty_doc.set(false);
         }
@@ -436,7 +386,6 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     });
     add_action(&window, "close", {
         let w = window.clone();
-        // close() emits close-request, so the usual save-and-persist runs.
         move || w.close()
     });
     gapp.set_accels_for_action("win.save", &["<Primary>s"]);
@@ -445,15 +394,24 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     gapp.set_accels_for_action("win.open-outline", &["<Primary>o"]);
     gapp.set_accels_for_action("win.close", &["<Primary>w", "<Primary>q"]);
 
-    // Periodic flushers. Polling a dirty flag avoids the cancellation bugs that
-    // come with rescheduling a timer on every keystroke.
+    // Styling keeps up with typing; re-parsing and saving run slower.
+    {
+        let a = app.clone();
+        glib::timeout_add_local(Duration::from_millis(STYLE_MS), move || {
+            if a.dirty_style.get() {
+                a.dirty_style.set(false);
+                a.restyle();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     {
         let a = app.clone();
         glib::timeout_add_local(Duration::from_millis(SAVE_DOC_MS), move || {
             if a.dirty_doc.get() {
-                a.commit_pending();
-                a.save_doc();
                 a.dirty_doc.set(false);
+                a.refresh_structure();
+                a.save_doc();
             }
             glib::ControlFlow::Continue
         });
@@ -462,8 +420,8 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         let a = app.clone();
         glib::timeout_add_local(Duration::from_millis(SAVE_STATE_MS), move || {
             if a.dirty_state.get() {
-                a.save_state();
                 a.dirty_state.set(false);
+                a.save_state();
             }
             glib::ControlFlow::Continue
         });
@@ -471,7 +429,6 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         window.connect_close_request(move |_| {
-            a.commit_pending();
             a.save_doc();
             a.save_state();
             a.save_window_state();
@@ -507,13 +464,17 @@ fn load_css() {
 impl App {
     pub fn present(&self) {
         self.window.present();
-        // A widget cannot take focus before it is mapped, and the initial
-        // document is opened while the window is still being built, so the grab
-        // in `select_path` is too early on startup. Retry once we are idle.
+        // A widget cannot take focus before it is mapped, and the first document
+        // opens while the window is still being built.
         let list = self.list.clone();
         glib::idle_add_local_once(move || {
             list.grab_focus();
         });
+    }
+
+    fn text(&self) -> String {
+        let (s, e) = self.buffer.bounds();
+        self.buffer.text(&s, &e, true).to_string()
     }
 
     // ---- rows --------------------------------------------------------------
@@ -527,8 +488,6 @@ impl App {
 
         expander.set_list_row(Some(&row));
         label.set_text(&obj.display_title());
-
-        // Mirror later renames onto the label without rebuilding the tree.
         let binding = obj
             .bind_property("title", &label, "label")
             .transform_to(|_, t: String| {
@@ -537,8 +496,6 @@ impl App {
             .build();
         unsafe { item.set_data("oma-title-binding", binding) };
 
-        // Watch fold state once per row. The handler dies with the row, so
-        // there is nothing to disconnect on unbind.
         unsafe {
             if row.data::<bool>("oma-watched").is_none() {
                 row.set_data("oma-watched", true);
@@ -548,22 +505,23 @@ impl App {
         }
     }
 
-    /// A row toggling only marks state dirty. What is actually collapsed is read
-    /// off the tree in `capture_collapsed` -- see there for why.
+    /// A row toggling marks state dirty and re-folds the document. What is
+    /// actually collapsed is read off the tree in `capture_collapsed`.
     fn on_row_expanded(&self, _row: &gtk::TreeListRow) {
-        if !self.loading.get() {
-            self.dirty_state.set(true);
+        if self.loading.get() {
+            return;
         }
+        self.dirty_state.set(true);
+        self.capture_collapsed();
+        self.apply_folds();
     }
 
     /// Read fold state from the rows that currently exist.
     ///
-    /// Trusting each row's `notify::expanded` does not work: collapsing a node
-    /// destroys its child rows, and they report themselves not-expanded on the
-    /// way out, so a parent's collapse was recorded as if the user had closed
-    /// every descendant too. Walking the live rows avoids that entirely --
-    /// descendants of a collapsed node have no rows, so their previously stored
-    /// state is left untouched rather than overwritten.
+    /// Collapsing a node destroys its child rows, and they report themselves
+    /// not-expanded on the way out, so trusting each row's signal recorded a
+    /// parent's collapse as if every descendant had been closed too. Rows only
+    /// exist for visible nodes, so walking them leaves deeper stored state alone.
     fn capture_collapsed(&self) {
         let mut st = self.dstate.borrow_mut();
         for i in 0..self.tree.n_items() {
@@ -581,12 +539,253 @@ impl App {
         }
     }
 
+    // ---- document rendering ------------------------------------------------
+
+    fn restyle(&self) {
+        self.loading.set(true);
+        docview::restyle(&self.buffer);
+        self.loading.set(false);
+        self.apply_folds();
+    }
+
+    /// Hide the contents of every collapsed section, leaving its heading visible.
+    fn apply_folds(&self) {
+        let text = self.text();
+        let (s, e) = self.buffer.bounds();
+        self.buffer.remove_tag_by_name("folded", &s, &e);
+
+        let lines = docview::heading_lines(&text);
+        let collapsed: Vec<NodePath> = self
+            .dstate
+            .borrow()
+            .collapsed
+            .iter()
+            .filter_map(|k| parse_path_key(k))
+            .collect();
+
+        for p in collapsed {
+            let Some(idx) = self.node_index(&p) else { continue };
+            let Some(&line) = lines.get(idx) else { continue };
+            let (start, end) = docview::section_range(&text, line);
+            let Some(mut from) = self.buffer.iter_at_line(start as i32) else { continue };
+            if !from.ends_line() {
+                from.forward_to_line_end();
+            }
+            let to = match self.buffer.iter_at_line(end as i32) {
+                Some(i) => i,
+                None => self.buffer.end_iter(),
+            };
+            if from < to {
+                self.buffer.apply_tag_by_name("folded", &from, &to);
+            }
+        }
+    }
+
+    /// Position of `path` in a depth-first walk, which is also its index among
+    /// the heading lines of the text.
+    fn node_index(&self, path: &[usize]) -> Option<usize> {
+        self.doc.borrow().walk().iter().position(|(p, _)| p == path)
+    }
+
+    fn path_at_index(&self, index: usize) -> Option<NodePath> {
+        self.doc.borrow().walk().get(index).map(|(p, _)| p.clone())
+    }
+
+    // ---- structure ---------------------------------------------------------
+
+    /// Re-parse the buffer and rebuild the outline. Expansion is restored from
+    /// stored state, so folding survives editing.
+    fn refresh_structure(&self) {
+        let text = self.text();
+        *self.doc.borrow_mut() = parse::parse(&text);
+        self.rebuild_tree();
+        self.apply_folds();
+    }
+
+    fn rebuild_tree(&self) {
+        self.loading.set(true);
+        self.root_store.remove_all();
+        {
+            let d = self.doc.borrow();
+            for (i, n) in d.roots.iter().enumerate() {
+                self.root_store
+                    .append(&NodeObject::new(vec![i], &n.title, !n.children.is_empty()));
+            }
+        }
+        self.apply_expansion();
+        self.loading.set(false);
+    }
+
+    fn apply_expansion(&self) {
+        let collapsed = self.dstate.borrow().collapsed.clone();
+        let mut i = 0;
+        while i < self.tree.n_items() {
+            if let Some(row) = self.tree.row(i) {
+                if row.is_expandable() {
+                    if let Some(obj) = row.item().and_downcast::<NodeObject>() {
+                        let want = !collapsed.contains(&path_key(&obj.path()));
+                        if row.is_expanded() != want {
+                            row.set_expanded(want);
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    fn find_row(&self, path: &[usize]) -> Option<u32> {
+        (0..self.tree.n_items()).find(|&i| {
+            self.tree
+                .row(i)
+                .and_then(|r| r.item())
+                .and_downcast::<NodeObject>()
+                .map(|o| o.path() == path)
+                .unwrap_or(false)
+        })
+    }
+
+    // ---- navigation --------------------------------------------------------
+
+    fn on_outline_selected(&self) {
+        if self.loading.get() {
+            return;
+        }
+        let Some(row) = self.selection.selected_item().and_downcast::<gtk::TreeListRow>() else {
+            return;
+        };
+        let Some(obj) = row.item().and_downcast::<NodeObject>() else { return };
+        let path = obj.path();
+        *self.selected.borrow_mut() = Some(path.clone());
+        self.dstate.borrow_mut().selected = Some(path_key(&path));
+        self.dirty_state.set(true);
+        self.scroll_to(&path);
+    }
+
+    /// Bring a section's heading to the top of the view without moving focus.
+    fn scroll_to(&self, path: &[usize]) {
+        let text = self.text();
+        let Some(idx) = self.node_index(path) else { return };
+        let Some(&line) = docview::heading_lines(&text).get(idx) else { return };
+        let Some(iter) = self.buffer.iter_at_line(line as i32) else { return };
+        self.view.scroll_to_iter(&mut iter.clone(), 0.0, true, 0.0, 0.08);
+    }
+
+    /// Follow the cursor: highlight whichever section it is sitting in.
+    fn sync_outline_to_cursor(&self) {
+        let text = self.text();
+        let cursor_line = self
+            .buffer
+            .iter_at_mark(&self.buffer.get_insert())
+            .line() as usize;
+        let lines = docview::heading_lines(&text);
+        let idx = match lines.iter().rposition(|&l| l <= cursor_line) {
+            Some(i) => i,
+            None => return,
+        };
+        let Some(path) = self.path_at_index(idx) else { return };
+        if self.selected.borrow().as_deref() == Some(path.as_slice()) {
+            return;
+        }
+        *self.selected.borrow_mut() = Some(path.clone());
+        if let Some(row) = self.find_row(&path) {
+            self.loading.set(true);
+            self.selection.set_selected(row);
+            self.loading.set(false);
+        }
+    }
+
+    /// Put the text cursor at the end of a section's heading and focus it.
+    fn put_cursor_at(&self, path: &[usize]) {
+        let text = self.text();
+        let Some(idx) = self.node_index(path) else { return };
+        let Some(&line) = docview::heading_lines(&text).get(idx) else { return };
+        let Some(mut iter) = self.buffer.iter_at_line(line as i32) else { return };
+        if !iter.ends_line() {
+            iter.forward_to_line_end();
+        }
+        self.buffer.place_cursor(&iter);
+        self.view.scroll_to_iter(&mut iter.clone(), 0.0, true, 0.0, 0.3);
+        self.focus_document();
+    }
+
+    fn focus_document(&self) {
+        self.view.grab_focus();
+    }
+
+    fn focus_outline(&self) {
+        self.list.grab_focus();
+    }
+
+    fn selected_row(&self) -> Option<gtk::TreeListRow> {
+        let i = self.selection.selected();
+        if i == gtk::INVALID_LIST_POSITION {
+            return None;
+        }
+        self.tree.row(i)
+    }
+
+    fn set_expanded(&self, expand: bool) -> bool {
+        match self.selected_row() {
+            Some(row) if row.is_expandable() && row.is_expanded() != expand => {
+                row.set_expanded(expand);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn collapse_or_parent(&self) {
+        if self.set_expanded(false) {
+            return;
+        }
+        let parent = self.selected.borrow().clone().filter(|p| p.len() > 1);
+        if let Some(p) = parent {
+            self.select_path(&p[..p.len() - 1]);
+        }
+    }
+
+    fn expand_or_child(&self) {
+        if self.set_expanded(true) {
+            return;
+        }
+        let child = self.selected.borrow().clone().and_then(|p| {
+            let has = self.doc.borrow().get(&p).map(|n| !n.children.is_empty()).unwrap_or(false);
+            has.then(|| {
+                let mut c = p.clone();
+                c.push(0);
+                c
+            })
+        });
+        if let Some(c) = child {
+            self.select_path(&c);
+        }
+    }
+
+    fn select_path(&self, path: &[usize]) {
+        for depth in 1..path.len() {
+            if let Some(row) = self.find_row(&path[..depth]).and_then(|i| self.tree.row(i)) {
+                if row.is_expandable() && !row.is_expanded() {
+                    row.set_expanded(true);
+                }
+            }
+        }
+        if let Some(i) = self.find_row(path) {
+            self.selection.set_selected(i);
+            *self.selected.borrow_mut() = Some(path.to_vec());
+            self.list.scroll_to(i, gtk::ListScrollFlags::NONE, None);
+            self.dstate.borrow_mut().selected = Some(path_key(path));
+            self.dirty_state.set(true);
+            self.list.grab_focus();
+        }
+    }
+
     // ---- editing -----------------------------------------------------------
 
+    /// Structural commands work on the parsed document and re-render the buffer.
+    /// Plain typing never goes through here, so the cost is paid only on the
+    /// rare restructuring keystroke.
     fn apply_cmd(self: &Rc<Self>, cmd: Cmd) {
-        // Anything typed but not yet in the model must land first, or the
-        // command would operate on stale text.
-        self.commit_pending();
         let at = self.selected.borrow().clone();
         if cmd.is_destructive() && self.needs_confirmation(at.as_deref()) {
             self.confirm_delete(at);
@@ -596,30 +795,34 @@ impl App {
     }
 
     fn run(&self, cmd: Cmd, at: Option<NodePath>) {
-        let outcome = {
-            let mut d = self.doc.borrow_mut();
-            edit::apply(&mut d, at.as_deref(), cmd)
+        let mut doc = parse::parse(&self.text());
+        let Some(out) = edit::apply(&mut doc, at.as_deref(), cmd) else { return };
+
+        let select = match out.select {
+            Some(p) => p,
+            None => doc.push_root(crate::model::Node::new("")),
         };
-        let Some(out) = outcome else { return };
+        self.set_text(&parse::serialize(&doc));
+        *self.doc.borrow_mut() = doc;
+        self.rebuild_tree();
+        self.apply_folds();
         self.dirty_doc.set(true);
-        if out.structural {
-            self.rebuild_tree();
+
+        if out.focus_title {
+            // A fresh section: land the cursor where its name goes.
+            self.select_path(&select);
+            self.put_cursor_at(&select);
+        } else {
+            self.select_path(&select);
+            self.scroll_to(&select);
         }
-        match out.select {
-            Some(p) => {
-                self.select_path(&p);
-                if out.focus_title {
-                    self.focus_title();
-                }
-            }
-            None => {
-                // Never leave the document with nowhere to type.
-                let p = self.doc.borrow_mut().push_root(Node::new(""));
-                self.rebuild_tree();
-                self.select_path(&p);
-                self.focus_title();
-            }
-        }
+    }
+
+    fn set_text(&self, text: &str) {
+        self.loading.set(true);
+        self.buffer.set_text(text);
+        docview::restyle(&self.buffer);
+        self.loading.set(false);
     }
 
     fn needs_confirmation(&self, at: Option<&[usize]>) -> bool {
@@ -644,14 +847,14 @@ impl App {
             }
         };
         let heading = if title.is_empty() {
-            "Delete this untitled node?".to_string()
+            "Delete this untitled section?".to_string()
         } else {
             format!("Delete \u{201c}{title}\u{201d}?")
         };
         let mut detail = String::new();
         if kids > 0 {
             detail.push_str(&format!(
-                "{kids} node{} beneath it will go too",
+                "{kids} section{} beneath it will go too",
                 if kids == 1 { "" } else { "s" }
             ));
         }
@@ -659,7 +862,7 @@ impl App {
             if !detail.is_empty() {
                 detail.push_str(", and ");
             }
-            detail.push_str("its notes will be deleted");
+            detail.push_str("its text will be deleted");
         }
         if detail.is_empty() {
             detail.push_str("This cannot be undone");
@@ -681,153 +884,10 @@ impl App {
         dlg.present(Some(&self.window));
     }
 
-    /// Push the title the user has typed into the model, and the body with it.
-    fn commit_pending(&self) {
-        let pending = self.pending_title.borrow_mut().take();
-        if let (Some(t), Some(p)) = (pending, self.selected.borrow().clone()) {
-            let changed = {
-                let mut d = self.doc.borrow_mut();
-                edit::apply(&mut d, Some(&p), Cmd::SetTitle(t.clone())).is_some()
-            };
-            if changed {
-                self.update_row_title(&p, &t);
-            }
-        }
-        self.flush_body();
-    }
-
-    fn update_row_title(&self, path: &[usize], title: &str) {
-        if let Some(i) = self.find_row(path) {
-            if let Some(obj) = self.tree.row(i).and_then(|r| r.item()).and_downcast::<NodeObject>() {
-                obj.set_title(title);
-            }
-        }
-    }
-
-    fn focus_title(&self) {
-        self.title_entry.grab_focus();
-    }
-
-    fn focus_body(&self) {
-        self.body_view.grab_focus();
-    }
-
-    fn focus_outline(&self) {
-        self.list.grab_focus();
-    }
-
-    /// The selected row, if any.
-    fn selected_row(&self) -> Option<gtk::TreeListRow> {
-        let i = self.selection.selected();
-        if i == gtk::INVALID_LIST_POSITION {
-            return None;
-        }
-        self.tree.row(i)
-    }
-
-    /// Set the selected row's expansion. Returns false when it was already
-    /// there, or the node has no children. GTK gives TreeExpander no dependable
-    /// Left/Right bindings of its own, so this is driven by hand.
-    fn set_expanded(&self, expand: bool) -> bool {
-        match self.selected_row() {
-            Some(row) if row.is_expandable() && row.is_expanded() != expand => {
-                row.set_expanded(expand);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Left: close the node, or step out to its parent if already closed.
-    fn collapse_or_parent(&self) {
-        if self.set_expanded(false) {
-            return;
-        }
-        let parent = self.selected.borrow().clone().filter(|p| p.len() > 1);
-        if let Some(p) = parent {
-            self.select_path(&p[..p.len() - 1]);
-        }
-    }
-
-    /// Right: open the node, or step in to its first child if already open.
-    fn expand_or_child(&self) {
-        if self.set_expanded(true) {
-            return;
-        }
-        let child = self.selected.borrow().clone().and_then(|p| {
-            let has = self.doc.borrow().get(&p).map(|n| !n.children.is_empty()).unwrap_or(false);
-            has.then(|| {
-                let mut c = p.clone();
-                c.push(0);
-                c
-            })
-        });
-        if let Some(c) = child {
-            self.select_path(&c);
-        }
-    }
-
-    // ---- selection / editors ----------------------------------------------
-
-    fn current_selection_path(&self) -> Option<NodePath> {
-        let row = self.selection.selected_item()?.downcast::<gtk::TreeListRow>().ok()?;
-        Some(row.item().and_downcast::<NodeObject>()?.path())
-    }
-
-    fn on_selection_changed(&self) {
-        if self.loading.get() {
-            return;
-        }
-        self.commit_pending();
-        let new = self.current_selection_path();
-        *self.selected.borrow_mut() = new.clone();
-        self.load_node(new.as_deref());
-        if let Some(p) = new {
-            self.dstate.borrow_mut().selected = Some(path_key(&p));
-            self.dirty_state.set(true);
-        }
-    }
-
-    /// Fill the title entry and body editor from the model.
-    fn load_node(&self, path: Option<&[usize]>) {
-        let (title, body) = match path {
-            Some(p) => self
-                .doc
-                .borrow()
-                .get(p)
-                .map(|n| (n.title.clone(), n.body.clone()))
-                .unwrap_or_default(),
-            None => (String::new(), String::new()),
-        };
-        self.loading.set(true);
-        self.title_entry.set_text(&title);
-        self.title_entry.set_sensitive(path.is_some());
-        self.buffer.set_text(&body);
-        // Undo history must not cross from one node into another.
-        self.buffer.set_enable_undo(false);
-        self.buffer.set_enable_undo(true);
-        self.loading.set(false);
-        self.pending_title.borrow_mut().take();
-    }
-
-    /// Copy the editor's contents back into the selected node.
-    fn flush_body(&self) {
-        let Some(p) = self.selected.borrow().clone() else { return };
-        let (s, e) = self.buffer.bounds();
-        let new = self.buffer.text(&s, &e, false).to_string().trim_end().to_string();
-        let mut d = self.doc.borrow_mut();
-        if let Some(n) = d.get_mut(&p) {
-            if n.body != new {
-                n.body = new;
-            }
-        }
-    }
-
     // ---- documents ---------------------------------------------------------
 
     pub fn open(&self, path: &PathBuf) {
         if self.path.borrow().is_some() {
-            self.commit_pending();
             self.save_doc();
             self.save_state();
             self.dirty_doc.set(false);
@@ -835,11 +895,11 @@ impl App {
         }
 
         let src = std::fs::read_to_string(path).unwrap_or_default();
-        *self.doc.borrow_mut() = parse::parse(&src);
         *self.path.borrow_mut() = Some(path.clone());
         *self.dstate.borrow_mut() = state::load_doc_state(path);
         *self.selected.borrow_mut() = None;
-        self.pending_title.borrow_mut().take();
+        self.set_text(&src);
+        *self.doc.borrow_mut() = parse::parse(&src);
 
         let title = self.doc.borrow().title.clone().unwrap_or_else(|| library::title_of(path));
         self.wtitle.set_title(&title);
@@ -848,10 +908,11 @@ impl App {
         self.window.set_title(Some(&format!("{title} — omaverse")));
         self.stack.set_visible_child_name("doc");
 
+        self.rebuild_tree();
+        self.apply_folds();
+
         state::push_recent(&mut self.recent.borrow_mut(), path);
         self.save_window_state();
-
-        self.rebuild_tree();
 
         let remembered = self
             .dstate
@@ -861,13 +922,15 @@ impl App {
             .and_then(|k| parse_path_key(&k))
             .filter(|p| self.doc.borrow().get(p).is_some());
         match remembered {
-            Some(p) => self.select_path(&p),
+            Some(p) => {
+                self.select_path(&p);
+                self.scroll_to(&p);
+            }
             None if !self.doc.borrow().is_empty() => self.select_path(&[0]),
-            None => self.load_node(None),
+            None => {}
         }
     }
 
-    /// Markdown-only filter list, shared by both choosers.
     fn md_filters() -> (gio::ListStore, gtk::FileFilter) {
         let md = gtk::FileFilter::new();
         md.set_name(Some("Markdown"));
@@ -881,8 +944,6 @@ impl App {
         (store, md)
     }
 
-    /// The outline directory may not exist yet; make it so the chooser can
-    /// start there rather than somewhere arbitrary.
     fn chooser_start_dir(&self) -> gio::File {
         let dir = &self.cfg.outline_dir;
         if !dir.exists() {
@@ -891,7 +952,10 @@ impl App {
         let start = if dir.exists() {
             dir.clone()
         } else {
-            self.path.borrow().clone().and_then(|p| p.parent().map(|q| q.to_path_buf()))
+            self.path
+                .borrow()
+                .clone()
+                .and_then(|p| p.parent().map(|q| q.to_path_buf()))
                 .unwrap_or_else(state::home)
         };
         gio::File::for_path(start)
@@ -943,24 +1007,20 @@ impl App {
         } else {
             PathBuf::from(format!("{text}.md"))
         };
-
-        // The chooser already asked about replacing, but silently destroying an
-        // outline is not a mistake worth allowing: open it instead.
-        let occupied = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
-        if occupied {
+        if std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
             self.refresh_library();
             self.open(&path);
-            self.wtitle.set_subtitle(&format!("{} — opened the existing outline", self.pretty(&path)));
+            self.wtitle
+                .set_subtitle(&format!("{} — opened the existing outline", self.pretty(&path)));
             return;
         }
-
         let name = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "Untitled".to_string());
         let mut d = Document::default();
         d.title = Some(name);
-        d.push_root(Node::new(""));
+        d.push_root(crate::model::Node::new(""));
         if let Err(e) = crate::atomic_write(&path, parse::serialize(&d).as_bytes()) {
             eprintln!("omaverse: could not create {}: {e}", path.display());
             self.wtitle.set_subtitle(&format!("Could not create outline — {e}"));
@@ -969,87 +1029,15 @@ impl App {
         }
         self.refresh_library();
         self.open(&path);
-        self.focus_title();
+        if let Some(p) = self.path_at_index(0) {
+            self.put_cursor_at(&p);
+        }
     }
 
-    fn pretty(&self, path: &std::path::Path) -> String {
+    fn pretty(&self, path: &Path) -> String {
         match path.strip_prefix(state::home()) {
             Ok(rest) => format!("~/{}", rest.display()),
             Err(_) => path.display().to_string(),
-        }
-    }
-
-    fn rebuild_tree(&self) {
-        self.loading.set(true);
-        self.root_store.remove_all();
-        {
-            let d = self.doc.borrow();
-            for (i, n) in d.roots.iter().enumerate() {
-                self.root_store
-                    .append(&NodeObject::new(vec![i], &n.title, !n.children.is_empty()));
-            }
-        }
-        self.apply_expansion();
-        self.loading.set(false);
-    }
-
-    /// Expand every row not listed as collapsed. Expanding a row inserts its
-    /// children immediately after it, so one forward pass reaches the whole tree.
-    fn apply_expansion(&self) {
-        let collapsed = self.dstate.borrow().collapsed.clone();
-        let mut i = 0;
-        while i < self.tree.n_items() {
-            if let Some(row) = self.tree.row(i) {
-                if row.is_expandable() {
-                    if let Some(obj) = row.item().and_downcast::<NodeObject>() {
-                        let want = !collapsed.contains(&path_key(&obj.path()));
-                        if row.is_expanded() != want {
-                            row.set_expanded(want);
-                        }
-                    }
-                }
-            }
-            i += 1;
-        }
-    }
-
-    fn find_row(&self, path: &[usize]) -> Option<u32> {
-        (0..self.tree.n_items()).find(|&i| {
-            self.tree
-                .row(i)
-                .and_then(|r| r.item())
-                .and_downcast::<NodeObject>()
-                .map(|o| o.path() == path)
-                .unwrap_or(false)
-        })
-    }
-
-    fn select_path(&self, path: &[usize]) {
-        // Every ancestor must be open, or the row does not exist yet.
-        for depth in 1..path.len() {
-            if let Some(row) = self.find_row(&path[..depth]).and_then(|i| self.tree.row(i)) {
-                if row.is_expandable() && !row.is_expanded() {
-                    row.set_expanded(true);
-                }
-            }
-        }
-        if let Some(i) = self.find_row(path) {
-            self.loading.set(true);
-            self.selection.set_selected(i);
-            *self.selected.borrow_mut() = Some(path.to_vec());
-            self.loading.set(false);
-            self.load_node(Some(path));
-            self.list.scroll_to(i, gtk::ListScrollFlags::NONE, None);
-            // `loading` suppresses on_selection_changed, so record the selection
-            // here too -- otherwise it is never persisted and reopening always
-            // lands on the first node.
-            self.dstate.borrow_mut().selected = Some(path_key(path));
-            self.dirty_state.set(true);
-            // Without this nothing holds keyboard focus after a document opens,
-            // so Enter and Tab silently do nothing until the user clicks a row.
-            // `run` grabs the title entry afterwards for a freshly made node, so
-            // this does not fight the new-node flow.
-            self.list.grab_focus();
         }
     }
 
@@ -1080,8 +1068,6 @@ impl App {
                 self.libbox.append(&entry_row(&e.title));
             }
         }
-
-        // Outlines saved outside the scanned directory are only reachable here.
         let outside: Vec<PathBuf> = self
             .recent
             .borrow()
@@ -1114,9 +1100,14 @@ impl App {
 
     // ---- saving ------------------------------------------------------------
 
+    /// Save what is in the buffer, verbatim. Typing is never reformatted
+    /// underneath the cursor; only structural commands rewrite the text.
     fn save_doc(&self) {
         let Some(path) = self.path.borrow().clone() else { return };
-        let text = parse::serialize(&self.doc.borrow());
+        let mut text = self.text();
+        if !text.ends_with('\n') && !text.is_empty() {
+            text.push('\n');
+        }
         match crate::atomic_write(&path, text.as_bytes()) {
             Ok(()) => {
                 self.wtitle.set_subtitle(&self.pretty(&path));
@@ -1150,6 +1141,21 @@ impl App {
     }
 }
 
+fn entry_row(title: &str) -> gtk::ListBoxRow {
+    let label = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .ellipsize(pango::EllipsizeMode::End)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&label));
+    row
+}
+
 fn plain_row(text: &str, classes: &[&str], wrap: bool) -> gtk::ListBoxRow {
     let label = gtk::Label::builder()
         .label(text)
@@ -1170,21 +1176,6 @@ fn plain_row(text: &str, classes: &[&str], wrap: bool) -> gtk::ListBoxRow {
     row
 }
 
-fn entry_row(title: &str) -> gtk::ListBoxRow {
-    let label = gtk::Label::builder()
-        .label(title)
-        .xalign(0.0)
-        .ellipsize(pango::EllipsizeMode::End)
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(6)
-        .margin_bottom(6)
-        .build();
-    let row = gtk::ListBoxRow::new();
-    row.set_child(Some(&label));
-    row
-}
-
-fn count_descendants(n: &Node) -> usize {
+fn count_descendants(n: &crate::model::Node) -> usize {
     n.children.len() + n.children.iter().map(count_descendants).sum::<usize>()
 }

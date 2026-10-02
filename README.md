@@ -70,34 +70,37 @@ taken, that outline is opened instead.
 
 ## Keys
 
+The document on the right is the whole book, continuously. The outline on the
+left is navigation: selecting a section scrolls to it, and collapsing one folds
+it away in the document too. The cursor and the outline follow each other.
+
 In the outline pane:
 
 | Key | Action |
 |---|---|
-| `Enter` | New node below |
+| `Enter` | New section below, cursor lands in its heading |
 | `Tab` / `Shift+Tab` | Indent / outdent |
 | `Alt+↑` / `Alt+↓` | Move up / down |
-| `←` | Collapse, or step out to the parent |
-| `→` | Expand, or step in to the first child |
-| `Delete` | Delete node (confirms if it has notes or children) |
-| `F2` | Rename — jumps to the title field |
+| `←` | Fold the section, or step out to its parent |
+| `→` | Unfold, or step in to the first child |
+| `Delete` | Delete section (confirms if it has text or children) |
+| `Ctrl+Enter` / `F2` | Jump into the document |
+
+In the document:
+
+| Key | Action |
+|---|---|
+| `Ctrl+Enter` / `Escape` | Back to the outline pane |
 
 Anywhere:
 
 | Key | Action |
 |---|---|
-| `Ctrl+Enter` | Jump between title and body |
-| `Escape` | Back to the outline pane |
 | `Ctrl+N` | New outline (opens a file chooser) |
 | `Ctrl+O` | Open an outline |
 | `Ctrl+S` | Save now (autosave already runs every 800 ms) |
 | `Ctrl+\\` | Toggle the library sidebar |
 | `Ctrl+W` / `Ctrl+Q` | Close (saves first) |
-
-A node's title is edited in the field above the body, not in the tree. `Enter`
-there drops into the body, which is the order you write in. Pressing `Enter` in
-the tree makes a new node and puts the cursor in its title, so a fresh outline is
-type-Enter-type-Enter.
 
 ## Build
 
@@ -110,17 +113,23 @@ cargo build --release
 
 ## Status
 
-Phases 1 and 2 of 4. Working: library sidebar with folder groups and recents,
-new/open via file chooser, outline tree with persistent fold state, full keyboard
-restructuring, rename, delete with confirmation, body editing, autosave, atomic
-writes.
+Working: library sidebar with folder groups and recents, new/open via file
+chooser, the whole book as one continuous document with headings styled by
+depth, an outline pane that navigates and folds it, keyboard restructuring,
+delete with confirmation, autosave, atomic writes.
 
-Not yet: live-rendered Markdown in the body pane (phase 3), installer /
-`.desktop` entry / external-change detection / spellcheck (phase 4).
+Not yet: inline fold triangles in the document itself (folding is driven from
+the outline pane for now), live-rendered bold/italic inside body text,
+installer / `.desktop` entry / external-change detection / spellcheck.
 
 ### Design notes
 
+The text buffer holds the file verbatim and is the single source of truth. The
+outline tree is derived from it by parsing, so there are no two copies to keep
+in sync, and what is saved is exactly what was typed — appearance comes entirely
+from tags that hide the `- ` markers and the leading indentation.
+
 Structural editing lives in `src/edit.rs` as pure functions of
-(document, selection) → (document, new selection), with no GTK involved, so the
-behaviour is tested without needing a display. The widget handlers only translate
-a keystroke into a command and apply the result.
+(document, selection) → (document, new selection), and line classification for
+rendering lives in `src/docview.rs`, also pure. Both are tested without a
+display; the widget handlers only translate a keystroke into a command.
