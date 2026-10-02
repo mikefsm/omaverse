@@ -137,13 +137,12 @@ chooser, the whole book as one continuous document with headings styled by
 depth, an outline pane that navigates and folds it, keyboard restructuring,
 delete with confirmation, autosave, atomic writes.
 
-Folding a section in the outline pane folds it away in the document too, and
-nothing is lost: the lifted text is parked with a mark and spliced back whenever
-the file is read or saved.
+Every section with anything underneath it carries a disclosure triangle in the
+margin beside its heading, and folding one hides its contents in place. Nothing
+is lost: the lifted text is parked with a mark and spliced back whenever the file
+is read or saved. The outline pane folds the same sections with the same state.
 
-Not yet: fold triangles in the document itself (folding is driven from the
-outline pane), live-rendered bold/italic inside body text, installer /
-`.desktop` entry / external-change detection / spellcheck.
+Not yet: live-rendered bold and italic inside body text, and spellcheck.
 
 ### Reorganising
 
@@ -217,8 +216,11 @@ phrase, leaving the text as it was.
 
 ### Folding
 
-GtkTextView has no real folding. An `invisible` tag hides the glyphs but keeps
-the line boxes, so a folded section leaves a blank hole exactly as tall as what
+The triangles are drawn in the text view's own left gutter rather than written
+into the text, because a marker character in the buffer would end up in the file.
+
+GtkTextView has no real folding either. An `invisible` tag hides the glyphs but
+keeps the line boxes, so a folded section leaves a blank hole exactly as tall as what
 it hid. Folding therefore removes the lines from the buffer and parks them with
 a `GtkTextMark`, which moves with surrounding edits. Everything that reads the
 document -- saving, re-parsing -- goes through `full_text()`, which splices the

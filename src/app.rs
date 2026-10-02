@@ -92,6 +92,8 @@ pub struct App {
     /// capture phase, so without this it intercepts Tab and Escape on their way
     /// down and the popover never sees them.
     note_open: Cell<bool>,
+    /// The fold triangles drawn beside the text.
+    gutter: RefCell<Option<gtk::DrawingArea>>,
     /// A section lifted by Cut, waiting to be pasted. Kept here rather than on
     /// the system clipboard so cutting a section never clobbers what you copied.
     clipboard: RefCell<Option<crate::model::Node>>,
@@ -300,6 +302,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         conflict: Cell::new(false),
         conflict_asked: Cell::new(false),
         note_open: Cell::new(false),
+        gutter: RefCell::new(None),
     });
 
     // These closures hold a strong Rc to App, which owns the widgets. The cycle
@@ -338,6 +341,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         let a = app.clone();
         doc_scroll.vadjustment().connect_value_changed(move |_| {
             a.dirty_style.set(true);
+            a.queue_gutter();
         });
     }
     {
@@ -561,6 +565,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         });
     }
 
+    app.install_gutter();
     app.refresh_library();
     if let Some(p) = cli.or(wstate.last_file).filter(|p| p.exists()) {
         app.open(&p);
@@ -660,6 +665,132 @@ impl App {
 
     }
 
+    // ---- fold triangles ----------------------------------------------------
+
+    /// A section can be folded if it has anything underneath to hide. Text
+    /// counts: a section holding a whole book and no subsections yet is exactly
+    /// the one you most want to collapse.
+    fn foldable(node: &crate::model::Node) -> bool {
+        !node.children.is_empty() || !node.body.trim().is_empty()
+    }
+
+    /// Triangles live in the text view's own left gutter, so they sit beside
+    /// each heading and scroll with it without being part of the text -- putting
+    /// a marker character in the buffer would write it to the file.
+    fn install_gutter(self: &Rc<Self>) {
+        let area = gtk::DrawingArea::new();
+        area.set_size_request(22, -1);
+        {
+            let me = self.clone();
+            area.set_draw_func(move |area, cr, _, _| me.draw_gutter(area, cr));
+        }
+        {
+            let me = self.clone();
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_, _, _, y| me.toggle_fold_at(y));
+            area.add_controller(click);
+        }
+        self.view.set_gutter(gtk::TextWindowType::Left, Some(&area));
+        *self.gutter.borrow_mut() = Some(area);
+    }
+
+    fn queue_gutter(&self) {
+        if let Some(area) = self.gutter.borrow().as_ref() {
+            area.queue_draw();
+        }
+    }
+
+    /// Heading lines currently on screen, with the path and foldability of each.
+    fn visible_headings(&self) -> Vec<(i32, NodePath, bool)> {
+        // Line numbers come from the buffer, which is what is on screen. Whether
+        // a section can be folded comes from the whole document: folding removes
+        // a section's contents from the buffer, so judging by the buffer would
+        // make an already-folded section look empty and drop its triangle --
+        // leaving no way to reopen it.
+        let text = self.text();
+        let onscreen = parse::parse(&text);
+        let walk = onscreen.walk();
+        let heads = docview::heading_lines(&text);
+        let rect = self.view.visible_rect();
+        let (top, _) = self.view.line_at_y(rect.y());
+        let (bottom, _) = self.view.line_at_y(rect.y() + rect.height());
+        (top.line()..=bottom.line())
+            .filter_map(|line| {
+                let idx = heads.iter().position(|&l| l == line as usize)?;
+                let (path, _) = walk.get(idx)?;
+                Some((line, path.clone(), self.is_foldable(path)))
+            })
+            .collect()
+    }
+
+    fn draw_gutter(&self, area: &gtk::DrawingArea, cr: &gtk4::cairo::Context) {
+        let collapsed = self.dstate.borrow().collapsed.clone();
+        let colour = area.color();
+        cr.set_source_rgba(
+            colour.red() as f64,
+            colour.green() as f64,
+            colour.blue() as f64,
+            0.5,
+        );
+        for (line, path, foldable) in self.visible_headings() {
+            if !foldable {
+                continue;
+            }
+            let Some(iter) = self.buffer.iter_at_line(line) else { continue };
+            let (y, height) = self.view.line_yrange(&iter);
+            let (_, wy) = self
+                .view
+                .buffer_to_window_coords(gtk::TextWindowType::Left, 0, y);
+            let middle = wy as f64 + height as f64 / 2.0;
+            triangle(cr, 11.0, middle, !collapsed.contains(&path_key(&path)));
+        }
+        let _ = cr.fill();
+    }
+
+    fn toggle_fold_at(self: &Rc<Self>, y: f64) {
+        let (_, by) = self
+            .view
+            .window_to_buffer_coords(gtk::TextWindowType::Left, 0, y as i32);
+        let (iter, _) = self.view.line_at_y(by);
+        let Some((_, path, foldable)) = self
+            .visible_headings()
+            .into_iter()
+            .find(|(line, _, _)| *line == iter.line())
+        else {
+            return;
+        };
+        if !foldable {
+            return;
+        }
+        // Folding rewrites the buffer this gutter is drawn against. Doing that
+        // inside the click is the shape that hung the app on a drag, so it waits
+        // until the gesture has finished.
+        let me = self.clone();
+        glib::idle_add_local_once(move || me.toggle_fold(&path));
+    }
+
+    /// Fold or unfold a section, keeping the outline and the gutter in step.
+    fn toggle_fold(&self, path: &[usize]) {
+        let key = path_key(path);
+        {
+            let mut st = self.dstate.borrow_mut();
+            if !st.collapsed.remove(&key) {
+                st.collapsed.insert(key);
+            }
+        }
+        self.dirty_state.set(true);
+        self.apply_folds();
+        self.loading.set(true);
+        self.apply_expansion();
+        self.loading.set(false);
+        self.queue_gutter();
+    }
+
+    /// Whether this section has anything under it to fold away.
+    fn is_foldable(&self, path: &[usize]) -> bool {
+        self.doc.borrow().get(path).map(Self::foldable).unwrap_or(false)
+    }
+
     // ---- notes ------------------------------------------------------------
 
     /// Which note, if any, the given place in the text belongs to.
@@ -745,7 +876,6 @@ impl App {
         }
         kinds.append(&mine);
         kinds.append(&quoted);
-        column.append(&kinds);
 
         let body = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::Word)
@@ -766,6 +896,10 @@ impl App {
             .build();
         scroller.add_css_class("card");
         column.append(&scroller);
+        // After the note, not before it: you write first, then say what it is.
+        // It also keeps every field reachable going forward with Tab, which is
+        // where GTK's focus handling kept breaking.
+        column.append(&kinds);
 
         // Attribution, shown only for a quotation.
         let source = gtk::Entry::builder()
@@ -785,6 +919,21 @@ impl App {
             recent.append(&button);
         }
         column.append(&recent);
+
+        // A source only means something for a quotation.
+        let reveal_source = {
+            let source = source.clone();
+            let recent = recent.clone();
+            move |quoting: bool| {
+                source.set_visible(quoting);
+                recent.set_visible(quoting && recent.first_child().is_some());
+            }
+        };
+        reveal_source(note.kind == NoteKind::Quotation);
+        {
+            let reveal_source = reveal_source.clone();
+            quoted.connect_toggled(move |b| reveal_source(b.is_active()));
+        }
 
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let remove = gtk::Button::with_label("Delete");
@@ -810,10 +959,8 @@ impl App {
                 let buffer = body.buffer();
                 let (s, e) = buffer.bounds();
                 let text = buffer.text(&s, &e, false).to_string();
-                // Filling in a source says "these are not my words" just as
-                // plainly as the toggle does, and saves reaching for it.
                 let src = source.text().to_string();
-                let kind = if quoted.is_active() || !src.trim().is_empty() {
+                let kind = if quoted.is_active() {
                     NoteKind::Quotation
                 } else {
                     NoteKind::Comment
@@ -1099,10 +1246,9 @@ impl App {
     fn apply_folds(&self) {
         self.unfold_all();
 
-        // Only sections with children may fold. The outline shows a disclosure
-        // triangle only for those, so folding anything else would hide its text
-        // with no way to get it back -- which is exactly what happened to a
-        // section holding a whole book and no subsections yet.
+        // Anything with content under it may fold: the gutter triangle beside
+        // the heading is always there to reopen it, which is what makes this
+        // safe now where it was not before.
         let doc = self.doc.borrow();
         let collapsed: Vec<NodePath> = self
             .dstate
@@ -1110,7 +1256,7 @@ impl App {
             .collapsed
             .iter()
             .filter_map(|k| parse_path_key(k))
-            .filter(|p| doc.get(p).map(|n| !n.children.is_empty()).unwrap_or(false))
+            .filter(|p| doc.get(p).map(Self::foldable).unwrap_or(false))
             .collect();
         drop(doc);
         let outermost: Vec<&NodePath> = collapsed
@@ -1157,6 +1303,7 @@ impl App {
         self.loading.set(false);
         let (first, last) = self.visible_lines();
         docview::restyle_range(&self.buffer, first, last);
+        self.queue_gutter();
     }
 
     /// Drop fold state that no longer names a foldable section.
@@ -1169,7 +1316,7 @@ impl App {
         let before = self.dstate.borrow().collapsed.len();
         self.dstate.borrow_mut().collapsed.retain(|k| {
             parse_path_key(k)
-                .and_then(|p| doc.get(&p).map(|n| !n.children.is_empty()))
+                .and_then(|p| doc.get(&p).map(Self::foldable))
                 .unwrap_or(false)
         });
         if self.dstate.borrow().collapsed.len() != before {
@@ -1361,8 +1508,17 @@ impl App {
         if self.set_expanded(false) {
             return;
         }
-        let parent = self.selected.borrow().clone().filter(|p| p.len() > 1);
-        if let Some(p) = parent {
+        // A section with text but no subsections has no expander in the outline,
+        // yet it still has something to fold.
+        let here = self.selected.borrow().clone();
+        if let Some(p) = here.as_ref() {
+            let key = path_key(p);
+            if self.is_foldable(p) && !self.dstate.borrow().collapsed.contains(&key) {
+                self.toggle_fold(p);
+                return;
+            }
+        }
+        if let Some(p) = here.filter(|p| p.len() > 1) {
             self.select_path(&p[..p.len() - 1]);
         }
     }
@@ -1370,6 +1526,14 @@ impl App {
     fn expand_or_child(&self) {
         if self.set_expanded(true) {
             return;
+        }
+        let here = self.selected.borrow().clone();
+        if let Some(p) = here.as_ref() {
+            let key = path_key(p);
+            if self.dstate.borrow().collapsed.contains(&key) {
+                self.toggle_fold(p);
+                return;
+            }
         }
         let child = self.selected.borrow().clone().and_then(|p| {
             let has = self.doc.borrow().get(&p).map(|n| !n.children.is_empty()).unwrap_or(false);
@@ -1942,6 +2106,21 @@ fn unwrap_anchor(text: &str, id: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
+}
+
+/// A disclosure triangle: pointing down when open, right when closed.
+fn triangle(cr: &gtk4::cairo::Context, x: f64, y: f64, open: bool) {
+    let size = 4.0;
+    if open {
+        cr.move_to(x - size, y - size / 2.0);
+        cr.line_to(x + size, y - size / 2.0);
+        cr.line_to(x, y + size * 0.9);
+    } else {
+        cr.move_to(x - size / 2.0, y - size);
+        cr.line_to(x + size * 0.9, y);
+        cr.line_to(x - size / 2.0, y + size);
+    }
+    cr.close_path();
 }
 
 fn entry_row(title: &str) -> gtk::ListBoxRow {
