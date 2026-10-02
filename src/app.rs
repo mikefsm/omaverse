@@ -94,6 +94,8 @@ pub struct App {
     note_open: Cell<bool>,
     /// The fold triangles drawn beside the text.
     gutter: RefCell<Option<gtk::DrawingArea>>,
+    /// None when no dictionary is installed; spelling is simply not marked then.
+    speller: Option<crate::spell::Speller>,
     /// A section lifted by Cut, waiting to be pasted. Kept here rather than on
     /// the system clipboard so cutting a section never clobbers what you copied.
     clipboard: RefCell<Option<crate::model::Node>>,
@@ -303,6 +305,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         conflict_asked: Cell::new(false),
         note_open: Cell::new(false),
         gutter: RefCell::new(None),
+        speller: crate::spell::Speller::new(),
     });
 
     // These closures hold a strong Rc to App, which owns the widgets. The cycle
@@ -440,6 +443,22 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         });
         view.add_controller(click);
     }
+    {
+        // Right-click offers corrections for the word under the pointer.
+        let a = app.clone();
+        let v = view.clone();
+        let menu = gtk::GestureClick::new();
+        menu.set_button(gdk::BUTTON_SECONDARY);
+        menu.connect_released(move |_, _, x, y| {
+            let (bx, by) =
+                v.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+            if let Some(iter) = v.iter_at_location(bx, by) {
+                a.buffer.place_cursor(&iter);
+                a.show_spelling();
+            }
+        });
+        view.add_controller(menu);
+    }
     // Ctrl+Enter and Escape move between the document and the outline.
     {
         let a = app.clone();
@@ -473,6 +492,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
                 } else {
                     a.undo();
                 }
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::Key::F7 {
+                a.show_spelling();
                 return glib::Propagation::Stop;
             }
             // Annotate the selection, or reopen the note the cursor sits in.
@@ -699,6 +722,118 @@ impl App {
         // Removed until it can actually be driven and verified, rather than
         // shipped on reasoning. Cmd::MoveTo and its tests are kept for its return.
 
+    }
+
+    // ---- spelling ----------------------------------------------------------
+
+    /// The word the cursor is in, with its bounds in the buffer.
+    fn word_at_cursor(&self) -> Option<(String, gtk::TextIter, gtk::TextIter)> {
+        let at = self.buffer.iter_at_mark(&self.buffer.get_insert());
+        let line = at.line();
+        let column = at.line_offset() as usize;
+        let text = self.text();
+        let raw = text.lines().nth(line as usize)?;
+        let (from, to) = crate::spell::words(raw)
+            .into_iter()
+            .find(|&(a, b)| column >= a && column <= b)?;
+        let word: String = raw.chars().take(to).skip(from).collect();
+        let mut start = self.buffer.iter_at_line(line)?;
+        start.forward_chars(from as i32);
+        let mut end = self.buffer.iter_at_line(line)?;
+        end.forward_chars(to as i32);
+        Some((word, start, end))
+    }
+
+    /// Where a position in the text sits on screen.
+    fn rect_for(&self, at: &gtk::TextIter) -> gdk::Rectangle {
+        let place = self.view.iter_location(at);
+        let (x, y) =
+            self.view
+                .buffer_to_window_coords(gtk::TextWindowType::Widget, place.x(), place.y());
+        gdk::Rectangle::new(x, y, place.width().max(1), place.height())
+    }
+
+    /// Offer corrections for the misspelled word under the cursor.
+    fn show_spelling(self: &Rc<Self>) {
+        let Some(speller) = self.speller.as_ref() else { return };
+        let Some((word, start, end)) = self.word_at_cursor() else { return };
+        if speller.is_correct(&word) {
+            return;
+        }
+        let suggestions = speller.suggest(&word);
+
+        let popover = gtk::Popover::new();
+        popover.set_parent(&self.view);
+        popover.set_autohide(true);
+        popover.set_pointing_to(Some(&self.rect_for(&start)));
+
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        column.set_margin_top(8);
+        column.set_margin_bottom(8);
+        column.set_margin_start(8);
+        column.set_margin_end(8);
+        column.set_size_request(220, -1);
+
+        if suggestions.is_empty() {
+            let none = gtk::Label::new(Some("No suggestions"));
+            none.add_css_class("dim-label");
+            none.set_margin_bottom(4);
+            column.append(&none);
+        }
+        for suggestion in &suggestions {
+            let button = gtk::Button::with_label(suggestion);
+            button.add_css_class("flat");
+            button.set_halign(gtk::Align::Fill);
+            let me = self.clone();
+            let popover2 = popover.clone();
+            let replacement = suggestion.clone();
+            let (from, to) = (start.offset(), end.offset());
+            button.connect_clicked(move |_| {
+                me.replace_range(from, to, &replacement);
+                popover2.popdown();
+            });
+            column.append(&button);
+        }
+
+        column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let learn = gtk::Button::with_label("Add to dictionary");
+        learn.add_css_class("flat");
+        {
+            let me = self.clone();
+            let popover2 = popover.clone();
+            let word = word.clone();
+            learn.connect_clicked(move |_| {
+                if let Some(speller) = me.speller.as_ref() {
+                    speller.learn(&word);
+                }
+                me.dirty_style.set(true);
+                me.restyle();
+                popover2.popdown();
+            });
+        }
+        column.append(&learn);
+
+        popover.set_child(Some(&column));
+        {
+            let me = self.clone();
+            popover.connect_closed(move |p| {
+                me.note_open.set(false);
+                p.unparent();
+            });
+        }
+        // Reuses the note flag: it means "a popover owns the keyboard", which is
+        // what the capture-phase handlers need to know.
+        self.note_open.set(true);
+        popover.popup();
+    }
+
+    fn replace_range(&self, from: i32, to: i32, text: &str) {
+        let mut start = self.buffer.iter_at_offset(from);
+        let mut end = self.buffer.iter_at_offset(to);
+        self.buffer.delete(&mut start, &mut end);
+        self.buffer.insert(&mut start, text);
+        self.dirty_doc.set(true);
+        self.dirty_style.set(true);
     }
 
     // ---- fold triangles ----------------------------------------------------
@@ -1283,7 +1418,13 @@ impl App {
     fn restyle(&self) {
         self.loading.set(true);
         let (first, last) = self.visible_lines();
-        docview::restyle_range(&self.buffer, first, last, self.cursor_line());
+        docview::restyle_range(
+            &self.buffer,
+            first,
+            last,
+            self.cursor_line(),
+            self.speller.as_ref(),
+        );
         self.loading.set(false);
         self.apply_folds();
     }
@@ -1352,7 +1493,13 @@ impl App {
             // begin_irreversible_action clears the whole undo history, and this
             // runs on every restyle. Calling it when there is nothing to fold
             // wiped undo several times a second.
-            docview::restyle_range(&self.buffer, 0, i32::MAX, self.cursor_line());
+            docview::restyle_range(
+                &self.buffer,
+                0,
+                i32::MAX,
+                self.cursor_line(),
+                self.speller.as_ref(),
+            );
             return;
         }
         self.loading.set(true);
@@ -1377,7 +1524,13 @@ impl App {
         self.buffer.end_irreversible_action();
         self.loading.set(false);
         let (first, last) = self.visible_lines();
-        docview::restyle_range(&self.buffer, first, last, self.cursor_line());
+        docview::restyle_range(
+            &self.buffer,
+            first,
+            last,
+            self.cursor_line(),
+            self.speller.as_ref(),
+        );
         self.queue_gutter();
     }
 

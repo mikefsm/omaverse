@@ -107,6 +107,7 @@ Anywhere:
 | `Ctrl+O` | Open an outline |
 | `Ctrl+S` | Save now (autosave already runs every 800 ms) |
 | `Ctrl+\\` | Toggle the library sidebar |
+| `F7` | Corrections for the misspelled word at the cursor |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo (also `Ctrl+Y`) |
 | `Ctrl+W` / `Ctrl+Q` | Close (saves first) |
 
@@ -148,7 +149,16 @@ Bold, italic and inline code render as you write: `**bold**`, `*italic*`,
 on, so what you are editing is never hidden from you, and a `*` opening a prose
 list is left alone rather than read as emphasis.
 
-Not yet: spellcheck.
+Misspelled words are underlined in the prose. `F7`, or a right-click, offers
+corrections and an **Add to dictionary** button — which matters more than it
+sounds, because a general dictionary does not know most biblical names and
+without it the marking is just noise.
+
+Spelling is checked through enchant rather than libspelling, deliberately:
+libspelling requires GtkSourceView, which would mean swapping the document's
+widget and buffer for GtkSourceView's own, and those bring their own undo
+implementation and their own gutter. A misspelling is just another tag, which
+this already knows how to do.
 
 ### Reorganising
 

@@ -6,6 +6,7 @@ mod library;
 mod model;
 mod nodeobj;
 mod parse;
+mod spell;
 mod state;
 mod theme;
 

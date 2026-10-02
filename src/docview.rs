@@ -234,6 +234,13 @@ pub fn install_tags(buffer: &gtk::TextBuffer) {
         table.add(&body);
     }
 
+    // Misspellings: the usual red squiggle, nothing else changed about the word.
+    let bad = gtk::TextTag::builder()
+        .name("misspelled")
+        .underline(gtk4::pango::Underline::Error)
+        .build();
+    table.add(&bad);
+
     // Note definitions: present, but clearly apparatus.
     let notedef = gtk::TextTag::builder()
         .name("notedef")
@@ -285,7 +292,13 @@ fn indent_px(depth: usize) -> i32 {
 /// buffer on every keystroke saturates the CPU on a book-length outline.
 /// Classification still runs over the whole text, because a line's depth
 /// depends on the nearest heading above it.
-pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32, cursor_line: i32) {
+pub fn restyle_range(
+    buffer: &gtk::TextBuffer,
+    first: i32,
+    last: i32,
+    cursor_line: i32,
+    speller: Option<&crate::spell::Speller>,
+) {
     let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true).to_string();
     let lines = classify(&text);
     if lines.is_empty() {
@@ -342,6 +355,24 @@ pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32, cursor_lin
             buffer.apply_tag_by_name("marker", &at(anchor.text.1), &at(anchor.span.1));
         }
 
+        // Spelling, over the prose only: a note definition is apparatus and a
+        // heading is full of names and references.
+        if let Some(speller) = speller {
+            if matches!(lines[i as usize], Line::Body { .. }) {
+                for (from_ch, to_ch) in crate::spell::words(raw) {
+                    let word: String = raw.chars().take(to_ch).skip(from_ch).collect();
+                    if speller.is_correct(&word) {
+                        continue;
+                    }
+                    let mut a = line_start;
+                    a.forward_chars(from_ch as i32);
+                    let mut b = line_start;
+                    b.forward_chars(to_ch as i32);
+                    buffer.apply_tag_by_name("misspelled", &a, &b);
+                }
+            }
+        }
+
         // Emphasis renders as you write. The markers stay visible on the line
         // the cursor is on, so what you are editing is never hidden from you.
         let reveal = i == cursor_line;
@@ -367,7 +398,7 @@ pub fn restyle_range(buffer: &gtk::TextBuffer, first: i32, last: i32, cursor_lin
 
 /// Restyle everything. Only for small buffers or a fresh document.
 pub fn restyle(buffer: &gtk::TextBuffer) {
-    restyle_range(buffer, 0, i32::MAX, -1);
+    restyle_range(buffer, 0, i32::MAX, -1, None);
 }
 
 /// The line a section starts on, and the line after everything it contains.
