@@ -22,7 +22,7 @@ use libadwaita as adw;
 use adw::prelude::*;
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -67,6 +67,9 @@ pub struct App {
     buffer: gtk::TextBuffer,
     libbox: gtk::ListBox,
     lib_paths: RefCell<Vec<Option<PathBuf>>>,
+    /// Outlines can be saved anywhere, so files outside `outline_dir` are kept
+    /// reachable through a Recent group in the sidebar.
+    recent: RefCell<Vec<PathBuf>>,
 }
 
 pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
@@ -198,10 +201,13 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
         .build();
     let new_btn = gtk::Button::from_icon_name("list-add-symbolic");
     new_btn.set_tooltip_text(Some("New outline (Ctrl+N)"));
+    let open_btn = gtk::Button::from_icon_name("document-open-symbolic");
+    open_btn.set_tooltip_text(Some("Open an outline (Ctrl+O)"));
     let sb_header = adw::HeaderBar::new();
     sb_header.set_title_widget(Some(&adw::WindowTitle::new("Outlines", "")));
     sb_header.set_show_end_title_buttons(false);
     sb_header.pack_end(&new_btn);
+    sb_header.pack_start(&open_btn);
     let sidebar = adw::ToolbarView::new();
     sidebar.add_top_bar(&sb_header);
     sidebar.set_content(Some(&lib_scroll));
@@ -261,6 +267,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
         buffer: buffer.clone(),
         libbox: libbox.clone(),
         lib_paths: RefCell::new(Vec::new()),
+        recent: RefCell::new(wstate.recent.clone()),
     });
 
     // Note: these closures hold a strong Rc to App, which also owns the widgets.
@@ -308,6 +315,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
     {
         let a = app.clone();
         new_from_empty.connect_clicked(move |_| a.new_outline());
+    }
+    {
+        let a = app.clone();
+        open_btn.connect_clicked(move |_| a.open_dialog());
     }
     {
         let s = split.clone();
@@ -387,9 +398,14 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) {
         let a = app.clone();
         move || a.new_outline()
     });
+    add_action(&window, "open-outline", {
+        let a = app.clone();
+        move || a.open_dialog()
+    });
     gapp.set_accels_for_action("win.save", &["<Primary>s"]);
     gapp.set_accels_for_action("win.toggle-sidebar", &["<Primary>backslash"]);
     gapp.set_accels_for_action("win.new-outline", &["<Primary>n"]);
+    gapp.set_accels_for_action("win.open-outline", &["<Primary>o"]);
 
     // Periodic flushers. Polling a dirty flag avoids the cancellation bugs that
     // come with rescheduling a timer on every keystroke.
@@ -709,6 +725,9 @@ impl App {
         self.window.set_title(Some(&format!("{title} — omaverse")));
         self.stack.set_visible_child_name("doc");
 
+        state::push_recent(&mut self.recent.borrow_mut(), path);
+        self.save_window_state();
+
         self.rebuild_tree();
 
         let remembered = self
@@ -725,50 +744,105 @@ impl App {
         }
     }
 
-    fn new_outline(self: &Rc<Self>) {
-        let entry = gtk::Entry::builder()
-            .placeholder_text("e.g. Romans")
-            .activates_default(true)
-            .build();
-        let dlg = adw::AlertDialog::new(
-            Some("New outline"),
-            Some(&format!("Created in {}", self.pretty(&self.cfg.outline_dir))),
-        );
-        dlg.set_extra_child(Some(&entry));
-        dlg.add_response("cancel", "Cancel");
-        dlg.add_response("create", "Create");
-        dlg.set_response_appearance("create", adw::ResponseAppearance::Suggested);
-        dlg.set_default_response(Some("create"));
-        dlg.set_close_response("cancel");
-        let me = self.clone();
-        dlg.connect_response(None, move |_, resp| {
-            if resp != "create" {
-                return;
-            }
-            let name = entry.text().to_string().trim().to_string();
-            if !name.is_empty() {
-                me.create_outline(&name);
-            }
-        });
-        dlg.present(Some(&self.window));
+    /// Markdown-only filter list, shared by both choosers.
+    fn md_filters() -> (gio::ListStore, gtk::FileFilter) {
+        let md = gtk::FileFilter::new();
+        md.set_name(Some("Markdown"));
+        md.add_suffix("md");
+        let all = gtk::FileFilter::new();
+        all.set_name(Some("All files"));
+        all.add_pattern("*");
+        let store = gio::ListStore::new::<gtk::FileFilter>();
+        store.append(&md);
+        store.append(&all);
+        (store, md)
     }
 
-    fn create_outline(&self, name: &str) {
-        let safe: String = name
-            .chars()
-            .map(|c| if std::path::is_separator(c) || c == ':' { '-' } else { c })
-            .collect();
-        let path = self.cfg.outline_dir.join(format!("{safe}.md"));
-        if !path.exists() {
-            let mut d = Document::default();
-            d.title = Some(name.to_string());
-            d.push_root(Node::new(""));
-            if let Err(e) = crate::atomic_write(&path, parse::serialize(&d).as_bytes()) {
-                eprintln!("omaverse: could not create {}: {e}", path.display());
-                self.wtitle.set_subtitle(&format!("Could not create outline — {e}"));
-                self.wtitle.add_css_class("oma-error");
-                return;
+    /// The outline directory may not exist yet; make it so the chooser can
+    /// start there rather than somewhere arbitrary.
+    fn chooser_start_dir(&self) -> gio::File {
+        let dir = &self.cfg.outline_dir;
+        if !dir.exists() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let start = if dir.exists() {
+            dir.clone()
+        } else {
+            self.path.borrow().clone().and_then(|p| p.parent().map(|q| q.to_path_buf()))
+                .unwrap_or_else(state::home)
+        };
+        gio::File::for_path(start)
+    }
+
+    fn new_outline(self: &Rc<Self>) {
+        let (filters, default) = Self::md_filters();
+        let dialog = gtk::FileDialog::builder()
+            .title("New outline")
+            .accept_label("Create")
+            .initial_folder(&self.chooser_start_dir())
+            .initial_name("Untitled.md")
+            .filters(&filters)
+            .default_filter(&default)
+            .modal(true)
+            .build();
+        let me = self.clone();
+        dialog.save(Some(&self.window), gio::Cancellable::NONE, move |res| {
+            if let Some(path) = res.ok().and_then(|f| f.path()) {
+                me.create_outline_at(&path);
             }
+        });
+    }
+
+    fn open_dialog(self: &Rc<Self>) {
+        let (filters, default) = Self::md_filters();
+        let dialog = gtk::FileDialog::builder()
+            .title("Open outline")
+            .initial_folder(&self.chooser_start_dir())
+            .filters(&filters)
+            .default_filter(&default)
+            .modal(true)
+            .build();
+        let me = self.clone();
+        dialog.open(Some(&self.window), gio::Cancellable::NONE, move |res| {
+            if let Some(path) = res.ok().and_then(|f| f.path()) {
+                me.refresh_library();
+                me.open(&path);
+            }
+        });
+    }
+
+    fn create_outline_at(&self, chosen: &Path) {
+        // Append rather than replace the extension: `with_extension` would turn
+        // "1 Cor 1.1" into "1 Cor 1.md".
+        let text = chosen.to_string_lossy();
+        let path = if text.ends_with(".md") {
+            chosen.to_path_buf()
+        } else {
+            PathBuf::from(format!("{text}.md"))
+        };
+
+        // The chooser already asked about replacing, but silently destroying an
+        // outline is not a mistake worth allowing: open it instead.
+        let occupied = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+        if occupied {
+            self.refresh_library();
+            self.open(&path);
+            self.wtitle.set_subtitle(&format!("{} — opened the existing outline", self.pretty(&path)));
+            return;
+        }
+
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Untitled".to_string());
+        let mut d = Document::default();
+        d.title = Some(name);
+        d.push_root(Node::new(""));
+        if let Err(e) = crate::atomic_write(&path, parse::serialize(&d).as_bytes()) {
+            eprintln!("omaverse: could not create {}: {e}", path.display());
+            self.wtitle.set_subtitle(&format!("Could not create outline — {e}"));
+            self.wtitle.add_css_class("oma-error");
+            return;
         }
         self.refresh_library();
         self.open(&path);
@@ -875,17 +949,25 @@ impl App {
             }
             for e in &g.entries {
                 paths.push(Some(e.path.clone()));
-                let label = gtk::Label::builder()
-                    .label(&e.title)
-                    .xalign(0.0)
-                    .ellipsize(pango::EllipsizeMode::End)
-                    .margin_start(12)
-                    .margin_end(12)
-                    .margin_top(6)
-                    .margin_bottom(6)
-                    .build();
-                let row = gtk::ListBoxRow::new();
-                row.set_child(Some(&label));
+                self.libbox.append(&entry_row(&e.title));
+            }
+        }
+
+        // Outlines saved outside the scanned directory are only reachable here.
+        let outside: Vec<PathBuf> = self
+            .recent
+            .borrow()
+            .iter()
+            .filter(|p| !p.starts_with(&self.cfg.outline_dir) && p.exists())
+            .cloned()
+            .collect();
+        if !outside.is_empty() {
+            paths.push(None);
+            self.libbox.append(&plain_row("RECENT", &["oma-group"], false));
+            for p in outside {
+                let row = entry_row(&library::title_of(&p));
+                row.set_tooltip_text(Some(&self.pretty(&p)));
+                paths.push(Some(p));
                 self.libbox.append(&row);
             }
         }
@@ -934,6 +1016,7 @@ impl App {
             paned: Some(self.paned.position()),
             sidebar_open: Some(self.split.shows_sidebar()),
             last_file: self.path.borrow().clone(),
+            recent: self.recent.borrow().clone(),
         });
     }
 }
@@ -955,6 +1038,21 @@ fn plain_row(text: &str, classes: &[&str], wrap: bool) -> gtk::ListBoxRow {
     row.set_child(Some(&label));
     row.set_selectable(false);
     row.set_activatable(false);
+    row
+}
+
+fn entry_row(title: &str) -> gtk::ListBoxRow {
+    let label = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .ellipsize(pango::EllipsizeMode::End)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&label));
     row
 }
 

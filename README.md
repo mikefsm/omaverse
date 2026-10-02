@@ -55,8 +55,18 @@ outside Dropbox: it is per-machine and disposable.
 outline_dir = "/home/you/Dropbox/Documents/Biblical Studies/Outlines"
 ```
 
-The directory is scanned recursively. Immediate subfolders become sidebar
-groups, so `Outlines/New Testament/romans.md` appears under "New Testament".
+This is only where the sidebar **looks** and where the file chooser **starts** —
+not a restriction. `Ctrl+N` opens a normal save dialog, so an outline can go
+anywhere on disk. The directory is scanned recursively and immediate subfolders
+become sidebar groups, so `Outlines/New Testament/romans.md` appears under
+"New Testament".
+
+Outlines saved outside that directory would otherwise be invisible to the
+sidebar, so the last ten files opened from elsewhere appear under a **Recent**
+group. `Ctrl+O` opens any file directly.
+
+Creating a new outline never overwrites an existing file: if the name is already
+taken, that outline is opened instead.
 
 ## Keys
 
@@ -76,7 +86,8 @@ Anywhere:
 | Key | Action |
 |---|---|
 | `Ctrl+Enter` | Jump between title and body |
-| `Ctrl+N` | New outline |
+| `Ctrl+N` | New outline (opens a file chooser) |
+| `Ctrl+O` | Open an outline |
 | `Ctrl+S` | Save now (autosave already runs every 800 ms) |
 | `Ctrl+\\` | Toggle the library sidebar |
 
@@ -96,9 +107,10 @@ cargo build --release
 
 ## Status
 
-Phases 1 and 2 of 4. Working: library sidebar with folder groups, new outline,
-outline tree with persistent fold state, full keyboard restructuring, rename,
-delete with confirmation, body editing, autosave, atomic writes.
+Phases 1 and 2 of 4. Working: library sidebar with folder groups and recents,
+new/open via file chooser, outline tree with persistent fold state, full keyboard
+restructuring, rename, delete with confirmation, body editing, autosave, atomic
+writes.
 
 Not yet: live-rendered Markdown in the body pane (phase 3), installer /
 `.desktop` entry / external-change detection / spellcheck (phase 4).

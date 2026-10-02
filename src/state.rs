@@ -30,6 +30,20 @@ pub struct WindowState {
     pub sidebar_open: Option<bool>,
     #[serde(default)]
     pub last_file: Option<PathBuf>,
+    /// Most-recently-opened first. Outlines can be saved anywhere, so files
+    /// outside the scanned directory would otherwise become unreachable.
+    #[serde(default)]
+    pub recent: Vec<PathBuf>,
+}
+
+/// Cap on remembered recent files.
+pub const RECENT_MAX: usize = 10;
+
+/// Move `path` to the front, de-duplicating, and trim to `RECENT_MAX`.
+pub fn push_recent(list: &mut Vec<PathBuf>, path: &Path) {
+    list.retain(|p| p != path);
+    list.insert(0, path.to_path_buf());
+    list.truncate(RECENT_MAX);
 }
 
 pub fn state_dir() -> PathBuf {
@@ -101,6 +115,25 @@ pub fn save_window_state(st: &WindowState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_recent_moves_to_front_without_duplicating() {
+        let mut r = vec![PathBuf::from("/b"), PathBuf::from("/a")];
+        push_recent(&mut r, Path::new("/a"));
+        assert_eq!(r, [PathBuf::from("/a"), PathBuf::from("/b")]);
+        push_recent(&mut r, Path::new("/c"));
+        assert_eq!(r, [PathBuf::from("/c"), PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn push_recent_is_capped() {
+        let mut r = Vec::new();
+        for i in 0..(RECENT_MAX + 5) {
+            push_recent(&mut r, Path::new(&format!("/f{i}")));
+        }
+        assert_eq!(r.len(), RECENT_MAX);
+        assert_eq!(r[0], PathBuf::from(&format!("/f{}", RECENT_MAX + 4)), "newest first");
+    }
 
     #[test]
     fn doc_key_is_stable_and_readable() {
