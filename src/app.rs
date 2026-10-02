@@ -42,6 +42,7 @@ const CSS: &str = "
 .oma-word { font-family: 'SBL BibLit','SBL Hebrew','SBL Greek',serif; font-size: 19pt; }
 .oma-annot { font-size: 9.5pt; opacity: 0.8; }
 .oma-annot-empty { opacity: 0.25; }
+.oma-word-entry { font-family: 'SBL BibLit','SBL Hebrew','SBL Greek',serif; font-size: 14pt; }
 .oma-group { font-size: 9pt; font-weight: bold; letter-spacing: 0.04em; }
 .oma-error { color: #e01b24; }
 ";
@@ -238,8 +239,14 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&libbox)
         .build();
-    let new_btn = gtk::Button::from_icon_name("list-add-symbolic");
-    new_btn.set_tooltip_text(Some("New outline (Ctrl+N)"));
+    let new_menu = gio::Menu::new();
+    new_menu.append(Some("New outline"), Some("win.new-outline"));
+    new_menu.append(Some("New interlinear"), Some("win.new-interlinear"));
+    let new_btn = gtk::MenuButton::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("New document")
+        .menu_model(&new_menu)
+        .build();
     let open_btn = gtk::Button::from_icon_name("document-open-symbolic");
     open_btn.set_tooltip_text(Some("Open an outline (Ctrl+O)"));
     let sb_header = adw::HeaderBar::new();
@@ -364,10 +371,6 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         libbox.connect_row_activated(move |_, row| a.on_library_activated(row));
-    }
-    {
-        let a = app.clone();
-        new_btn.connect_clicked(move |_| a.new_outline());
     }
     {
         let a = app.clone();
@@ -537,6 +540,24 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         doc_scroll.add_controller(kc);
     }
 
+    // Caught here rather than left to an accelerator. Accelerators for this
+    // have not proved reliable, and this works whichever view is showing.
+    {
+        let a = app.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            if state.contains(gdk::ModifierType::CONTROL_MASK)
+                && (key == gdk::Key::i || key == gdk::Key::I)
+            {
+                a.new_interlinear();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        window.add_controller(keys);
+    }
+
     // ---- actions -----------------------------------------------------------
     add_action(&window, "save", {
         let a = app.clone();
@@ -552,6 +573,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     add_action(&window, "new-outline", {
         let a = app.clone();
         move || a.new_outline()
+    });
+    add_action(&window, "new-interlinear", {
+        let a = app.clone();
+        move || a.new_interlinear()
     });
     add_action(&window, "open-outline", {
         let a = app.clone();
@@ -574,6 +599,9 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     gapp.set_accels_for_action("win.save", &["<Primary>s"]);
     gapp.set_accels_for_action("win.toggle-sidebar", &["<Primary>backslash"]);
     gapp.set_accels_for_action("win.new-outline", &["<Primary>n"]);
+    // Ctrl+I, not Ctrl+Shift+N: a two-modifier accelerator never fires here,
+    // the same reason redo had to be handled by hand.
+    gapp.set_accels_for_action("win.new-interlinear", &["<Primary>i"]);
     gapp.set_accels_for_action("win.open-outline", &["<Primary>o"]);
     gapp.set_accels_for_action("win.close", &["<Primary>w", "<Primary>q"]);
     gapp.set_accels_for_action("win.undo", &["<Primary>z"]);
@@ -2080,6 +2108,147 @@ impl App {
                 me.create_outline_at(&path);
             }
         });
+    }
+
+    /// Start a sheet: say what passage it is, in what language, and paste the
+    /// text in. Pasting here rather than afterwards is the point -- the words
+    /// have to exist before there is anything to annotate.
+    fn new_interlinear(self: &Rc<Self>) {
+        let reference = gtk::Entry::builder()
+            .placeholder_text("Passage — e.g. Jude 4, or Romans 8:1-4")
+            .build();
+
+        let language = gtk::DropDown::from_strings(&["Greek", "Hebrew", "Other"]);
+        let language_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let language_label = gtk::Label::new(Some("Language"));
+        language_label.set_halign(gtk::Align::Start);
+        language_row.append(&language_label);
+        language.set_hexpand(true);
+        language_row.append(&language);
+
+        let passage = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::Word)
+            .accepts_tab(false)
+            .top_margin(6)
+            .bottom_margin(6)
+            .left_margin(6)
+            .right_margin(6)
+            .build();
+        passage.add_css_class("oma-word-entry");
+        let passage_box = gtk::ScrolledWindow::builder()
+            .min_content_height(120)
+            .max_content_height(260)
+            .propagate_natural_height(true)
+            .child(&passage)
+            .build();
+        passage_box.add_css_class("card");
+
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        column.set_size_request(420, -1);
+        column.append(&reference);
+        column.append(&language_row);
+        let hint = gtk::Label::new(Some("Paste the passage — it is split into words"));
+        hint.add_css_class("dim-label");
+        hint.set_halign(gtk::Align::Start);
+        column.append(&hint);
+        column.append(&passage_box);
+
+        let dlg = adw::AlertDialog::new(Some("New interlinear"), None);
+        dlg.set_extra_child(Some(&column));
+        dlg.add_response("cancel", "Cancel");
+        dlg.add_response("create", "Create");
+        dlg.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+        dlg.set_default_response(Some("create"));
+        dlg.set_close_response("cancel");
+
+        let me = self.clone();
+        dlg.connect_response(None, move |_, answer| {
+            if answer != "create" {
+                return;
+            }
+            let reference = reference.text().to_string().trim().to_string();
+            if reference.is_empty() {
+                return;
+            }
+            let language = match language.selected() {
+                1 => crate::interlinear::Language::Hebrew,
+                2 => crate::interlinear::Language::Other,
+                _ => crate::interlinear::Language::Greek,
+            };
+            let buffer = passage.buffer();
+            let (start, end) = buffer.bounds();
+            let text = buffer.text(&start, &end, false).to_string();
+            me.choose_sheet_path(reference, language, text);
+        });
+        dlg.present(Some(&self.window));
+    }
+
+    /// Where the sheet goes. The same chooser as a new outline, so one habit
+    /// covers both.
+    fn choose_sheet_path(
+        self: &Rc<Self>,
+        reference: String,
+        language: crate::interlinear::Language,
+        passage: String,
+    ) {
+        let safe: String = reference
+            .chars()
+            .map(|c| if std::path::is_separator(c) || c == ':' { '-' } else { c })
+            .collect();
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        let toml = gtk::FileFilter::new();
+        toml.set_name(Some("Interlinear"));
+        toml.add_suffix("toml");
+        filters.append(&toml);
+
+        let dialog = gtk::FileDialog::builder()
+            .title("New interlinear")
+            .accept_label("Create")
+            .initial_folder(&self.chooser_start_dir())
+            .initial_name(format!("{safe}.toml"))
+            .filters(&filters)
+            .default_filter(&toml)
+            .modal(true)
+            .build();
+        let me = self.clone();
+        dialog.save(Some(&self.window), gio::Cancellable::NONE, move |res| {
+            if let Some(path) = res.ok().and_then(|f| f.path()) {
+                me.create_sheet_at(&path, &reference, language, &passage);
+            }
+        });
+    }
+
+    fn create_sheet_at(
+        &self,
+        chosen: &Path,
+        reference: &str,
+        language: crate::interlinear::Language,
+        passage: &str,
+    ) {
+        let text = chosen.to_string_lossy();
+        let path = if text.ends_with(".toml") {
+            chosen.to_path_buf()
+        } else {
+            PathBuf::from(format!("{text}.toml"))
+        };
+        // The same rule as outlines: never write over something already there.
+        if std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
+            self.refresh_library();
+            self.open(&path.clone());
+            self.wtitle
+                .set_subtitle(&format!("{} — opened the existing sheet", self.pretty(&path)));
+            return;
+        }
+        let mut sheet = Interlinear::new(reference, language);
+        sheet.append_text(passage);
+        if let Err(e) = crate::atomic_write(&path, sheet.to_toml().as_bytes()) {
+            eprintln!("omaverse: could not create {}: {e}", path.display());
+            self.wtitle.set_subtitle(&format!("Could not create — {e}"));
+            self.wtitle.add_css_class("oma-error");
+            return;
+        }
+        self.refresh_library();
+        self.open(&path);
     }
 
     fn open_dialog(self: &Rc<Self>) {

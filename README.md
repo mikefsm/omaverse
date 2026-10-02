@@ -138,6 +138,18 @@ When that happens you are asked which version wins, and the one you set aside is
 written to `~/.local/state/omaverse/conflicts/` rather than discarded. If the
 file changes while you have no unsaved edits, it just reloads.
 
+### Interlinears
+
+`Ctrl+I`, or **New interlinear** in the + menu. Name the passage, choose Hebrew
+or Greek, and paste the text straight into the dialog: it is split into words
+there and then, because the words have to exist before there is anything to
+annotate.
+
+A sheet opens into its own view — it is not prose and has no sections to fold.
+Each word is a column with its annotations beneath it, and Hebrew lays out right
+to left. Sheets are `.toml` beside the outlines, and the file extension is what
+says which is which.
+
 ### Theming
 
 omaverse follows the current omarchy theme. Themes publish a palette at
