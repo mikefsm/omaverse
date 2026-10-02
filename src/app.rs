@@ -646,7 +646,12 @@ impl App {
                 let to = unsafe { ptr.as_ref() }.clone();
                 let height = ex.height() as f64;
                 let zone = if height > 0.0 { y / height } else { 0.5 };
-                me.drop_section(&from, &to, zone);
+                // The move rebuilds the outline, destroying every row including
+                // the one whose drop controller is running right now. Doing that
+                // inside the drop hangs GTK mid-drag, so let the drag finish
+                // first and move on the next idle.
+                let me = me.clone();
+                glib::idle_add_local_once(move || me.drop_section(&from, &to, zone));
                 true
             });
         }
@@ -1480,14 +1485,18 @@ impl App {
         *self.lib_paths.borrow_mut() = paths;
     }
 
-    fn on_library_activated(&self, row: &gtk::ListBoxRow) {
+    fn on_library_activated(self: &Rc<Self>, row: &gtk::ListBoxRow) {
         let idx = row.index();
         if idx < 0 {
             return;
         }
-        if let Some(p) = self.lib_paths.borrow().get(idx as usize).cloned().flatten() {
-            self.open(&p);
-        }
+        let Some(path) = self.lib_paths.borrow().get(idx as usize).cloned().flatten() else {
+            return;
+        };
+        // Opening tears down and rebuilds both panes; the same reasoning as the
+        // drop handler applies, so it waits until this signal has returned.
+        let me = self.clone();
+        glib::idle_add_local_once(move || me.open(&path));
     }
 
     // ---- watching the file ------------------------------------------------
