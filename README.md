@@ -118,9 +118,22 @@ chooser, the whole book as one continuous document with headings styled by
 depth, an outline pane that navigates and folds it, keyboard restructuring,
 delete with confirmation, autosave, atomic writes.
 
-Not yet: inline fold triangles in the document itself (folding is driven from
-the outline pane for now), live-rendered bold/italic inside body text,
-installer / `.desktop` entry / external-change detection / spellcheck.
+Folding a section in the outline pane folds it away in the document too, and
+nothing is lost: the lifted text is parked with a mark and spliced back whenever
+the file is read or saved.
+
+Not yet: fold triangles in the document itself (folding is driven from the
+outline pane), live-rendered bold/italic inside body text, installer /
+`.desktop` entry / external-change detection / spellcheck.
+
+### Folding
+
+GtkTextView has no real folding. An `invisible` tag hides the glyphs but keeps
+the line boxes, so a folded section leaves a blank hole exactly as tall as what
+it hid. Folding therefore removes the lines from the buffer and parks them with
+a `GtkTextMark`, which moves with surrounding edits. Everything that reads the
+document -- saving, re-parsing -- goes through `full_text()`, which splices the
+parked text back, so a fold can never cost you content.
 
 ### Design notes
 

@@ -51,6 +51,10 @@ pub struct App {
     dirty_doc: Cell<bool>,
     dirty_style: Cell<bool>,
     dirty_state: Cell<bool>,
+    /// Guards against queueing the post-fold work more than once per pass.
+    fold_pending: Cell<bool>,
+    /// Expansion changes seen since the last settle, resolved together.
+    pending_toggles: RefCell<Vec<(NodePath, bool)>>,
     /// Set while the app drives the widgets, so their change signals are not
     /// mistaken for the user typing.
     loading: Cell<bool>,
@@ -69,6 +73,18 @@ pub struct App {
     libbox: gtk::ListBox,
     lib_paths: RefCell<Vec<Option<PathBuf>>>,
     recent: RefCell<Vec<PathBuf>>,
+    /// Text lifted out of the buffer by folding, with a mark where it belongs.
+    folds: RefCell<Vec<Fold>>,
+}
+
+/// A folded-away section. GtkTextView has no real folding -- an `invisible` tag
+/// hides the glyphs but keeps the line boxes, leaving a blank hole as tall as
+/// what it hid -- so the text is removed from the buffer and parked here. The
+/// mark moves with surrounding edits, so it still points at the right place
+/// when the section is restored.
+struct Fold {
+    mark: gtk::TextMark,
+    text: String,
 }
 
 pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
@@ -235,6 +251,8 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         dirty_doc: Cell::new(false),
         dirty_style: Cell::new(false),
         dirty_state: Cell::new(false),
+        fold_pending: Cell::new(false),
+        pending_toggles: RefCell::new(Vec::new()),
         loading: Cell::new(false),
         window: window.clone(),
         wtitle,
@@ -250,6 +268,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         libbox: libbox.clone(),
         lib_paths: RefCell::new(Vec::new()),
         recent: RefCell::new(wstate.recent.clone()),
+        folds: RefCell::new(Vec::new()),
     });
 
     // These closures hold a strong Rc to App, which owns the widgets. The cycle
@@ -505,38 +524,62 @@ impl App {
         }
     }
 
-    /// A row toggling marks state dirty and re-folds the document. What is
-    /// actually collapsed is read off the tree in `capture_collapsed`.
-    fn on_row_expanded(&self, _row: &gtk::TreeListRow) {
+    /// A row toggling marks state dirty and re-folds the document.
+    ///
+    /// The work is deferred to idle, and that is not optional: this runs from
+    /// inside `gtk_tree_list_row_set_expanded`, and `capture_collapsed` reads
+    /// rows back out of the same model. Re-entering a GtkTreeListModel while it
+    /// is still mutating segfaults in GTK, which is exactly what it did.
+    fn on_row_expanded(self: &Rc<Self>, row: &gtk::TreeListRow) {
         if self.loading.get() {
             return;
         }
+        // Only the row's own properties are touched here. Looking rows up by
+        // position in the model while it is still mutating segfaults GTK, so
+        // everything else waits for idle.
+        let Some(obj) = row.item().and_downcast::<NodeObject>() else { return };
+        self.pending_toggles.borrow_mut().push((obj.path(), row.is_expanded()));
         self.dirty_state.set(true);
-        self.capture_collapsed();
-        self.apply_folds();
+        if self.fold_pending.replace(true) {
+            return;
+        }
+        let me = self.clone();
+        glib::idle_add_local_once(move || me.settle_toggles());
     }
 
-    /// Read fold state from the rows that currently exist.
-    ///
-    /// Collapsing a node destroys its child rows, and they report themselves
-    /// not-expanded on the way out, so trusting each row's signal recorded a
-    /// parent's collapse as if every descendant had been closed too. Rows only
-    /// exist for visible nodes, so walking them leaves deeper stored state alone.
-    fn capture_collapsed(&self) {
-        let mut st = self.dstate.borrow_mut();
-        for i in 0..self.tree.n_items() {
-            let Some(row) = self.tree.row(i) else { continue };
-            if !row.is_expandable() {
-                continue;
-            }
-            let Some(obj) = row.item().and_downcast::<NodeObject>() else { continue };
-            let key = path_key(&obj.path());
-            if row.is_expanded() {
-                st.collapsed.remove(&key);
-            } else {
-                st.collapsed.insert(key);
+    /// Resolve a batch of expansion changes once the model has settled.
+    fn settle_toggles(&self) {
+        self.fold_pending.set(false);
+        let batch = std::mem::take(&mut *self.pending_toggles.borrow_mut());
+        let closed: Vec<NodePath> = batch
+            .iter()
+            .filter(|(_, open)| !*open)
+            .map(|(p, _)| p.clone())
+            .collect();
+        {
+            let mut st = self.dstate.borrow_mut();
+            for (path, open) in &batch {
+                // Collapsing a row destroys its descendants, and they report
+                // themselves closed on the way out. That is GTK tearing them
+                // down, not the user closing them, so ignore anything beneath a
+                // row closed in this same batch.
+                if closed.iter().any(|c| c.len() < path.len() && path.starts_with(c)) {
+                    continue;
+                }
+                let key = path_key(path);
+                if *open {
+                    st.collapsed.remove(&key);
+                } else {
+                    st.collapsed.insert(key);
+                }
             }
         }
+        // Expanding a row builds its children fresh, and GtkTreeListModel makes
+        // them unexpanded however they were left. Put them back.
+        self.loading.set(true);
+        self.apply_expansion();
+        self.loading.set(false);
+        self.apply_folds();
     }
 
     // ---- document rendering ------------------------------------------------
@@ -548,13 +591,32 @@ impl App {
         self.apply_folds();
     }
 
-    /// Hide the contents of every collapsed section, leaving its heading visible.
-    fn apply_folds(&self) {
-        let text = self.text();
-        let (s, e) = self.buffer.bounds();
-        self.buffer.remove_tag_by_name("folded", &s, &e);
+    /// Restore every folded section, leaving the buffer holding the whole file.
+    fn unfold_all(&self) {
+        if self.folds.borrow().is_empty() {
+            return;
+        }
+        let mut folds = std::mem::take(&mut *self.folds.borrow_mut());
+        // Descending offset, so each insertion leaves earlier offsets valid.
+        folds.sort_by_key(|f| std::cmp::Reverse(self.buffer.iter_at_mark(&f.mark).offset()));
+        self.loading.set(true);
+        self.buffer.begin_irreversible_action();
+        for f in folds {
+            let mut at = self.buffer.iter_at_mark(&f.mark);
+            self.buffer.insert(&mut at, &f.text);
+            self.buffer.delete_mark(&f.mark);
+        }
+        self.buffer.end_irreversible_action();
+        self.loading.set(false);
+    }
 
-        let lines = docview::heading_lines(&text);
+    /// Make the buffer match what is collapsed: unfold everything, then lift out
+    /// each collapsed section's contents. Folding wholesale rather than
+    /// incrementally keeps nesting trivial -- a collapsed section inside another
+    /// collapsed section is simply never folded separately.
+    fn apply_folds(&self) {
+        self.unfold_all();
+
         let collapsed: Vec<NodePath> = self
             .dstate
             .borrow()
@@ -562,29 +624,76 @@ impl App {
             .iter()
             .filter_map(|k| parse_path_key(k))
             .collect();
+        let outermost: Vec<&NodePath> = collapsed
+            .iter()
+            .filter(|p| !collapsed.iter().any(|q| q.len() < p.len() && p.starts_with(q)))
+            .collect();
 
-        for p in collapsed {
-            let Some(idx) = self.node_index(&p) else { continue };
-            let Some(&line) = lines.get(idx) else { continue };
-            let (start, end) = docview::section_range(&text, line);
-            let Some(mut from) = self.buffer.iter_at_line(start as i32) else { continue };
-            if !from.ends_line() {
-                from.forward_to_line_end();
-            }
-            let to = match self.buffer.iter_at_line(end as i32) {
+        let text = self.text();
+        let mut ranges: Vec<(usize, usize)> = outermost
+            .iter()
+            .filter_map(|p| self.buffer_line_for(p).map(|l| docview::section_range(&text, l)))
+            .collect();
+        // Descending, so each deletion leaves earlier line numbers valid.
+        ranges.sort_by_key(|&(s, _)| std::cmp::Reverse(s));
+
+        self.loading.set(true);
+        self.buffer.begin_irreversible_action();
+        for (start, end) in ranges {
+            // Whole lines only, from the one after the heading. Starting at the
+            // end of the heading line would swallow its newline and weld the
+            // next heading onto it.
+            let Some(mut from) = self.buffer.iter_at_line(start as i32 + 1) else { continue };
+            let mut to = match self.buffer.iter_at_line(end as i32) {
                 Some(i) => i,
                 None => self.buffer.end_iter(),
             };
-            if from < to {
-                self.buffer.apply_tag_by_name("folded", &from, &to);
+            if from >= to {
+                continue;
             }
+            let lifted = self.buffer.text(&from, &to, true).to_string();
+            let mark = self.buffer.create_mark(None, &from, true);
+            self.buffer.delete(&mut from, &mut to);
+            self.folds.borrow_mut().push(Fold { mark, text: lifted });
         }
+        self.buffer.end_irreversible_action();
+        self.loading.set(false);
+        docview::restyle(&self.buffer);
     }
 
-    /// Position of `path` in a depth-first walk, which is also its index among
-    /// the heading lines of the text.
-    fn node_index(&self, path: &[usize]) -> Option<usize> {
-        self.doc.borrow().walk().iter().position(|(p, _)| p == path)
+    /// The whole file, with folded sections spliced back in. Everything that
+    /// reads the document -- saving, re-parsing -- goes through this, never the
+    /// buffer directly, or folded text would be lost.
+    fn full_text(&self) -> String {
+        let mut text = self.text();
+        let folds = self.folds.borrow();
+        if folds.is_empty() {
+            return text;
+        }
+        let mut parked: Vec<(usize, &str)> = folds
+            .iter()
+            .map(|f| (self.buffer.iter_at_mark(&f.mark).offset() as usize, f.text.as_str()))
+            .collect();
+        parked.sort_by_key(|&(o, _)| std::cmp::Reverse(o));
+        for (chars, chunk) in parked {
+            let byte = text
+                .char_indices()
+                .nth(chars)
+                .map(|(b, _)| b)
+                .unwrap_or(text.len());
+            text.insert_str(byte, chunk);
+        }
+        text
+    }
+
+    /// Which buffer line a section's heading is on right now. Parsed from the
+    /// buffer rather than the full text because folding removes a section's
+    /// contents but keeps its heading, so every still-visible node keeps the
+    /// same path in both.
+    fn buffer_line_for(&self, path: &[usize]) -> Option<usize> {
+        let text = self.text();
+        let idx = parse::parse(&text).walk().iter().position(|(p, _)| p == path)?;
+        docview::heading_lines(&text).get(idx).copied()
     }
 
     fn path_at_index(&self, index: usize) -> Option<NodePath> {
@@ -596,7 +705,7 @@ impl App {
     /// Re-parse the buffer and rebuild the outline. Expansion is restored from
     /// stored state, so folding survives editing.
     fn refresh_structure(&self) {
-        let text = self.text();
+        let text = self.full_text();
         *self.doc.borrow_mut() = parse::parse(&text);
         self.rebuild_tree();
         self.apply_folds();
@@ -664,9 +773,7 @@ impl App {
 
     /// Bring a section's heading to the top of the view without moving focus.
     fn scroll_to(&self, path: &[usize]) {
-        let text = self.text();
-        let Some(idx) = self.node_index(path) else { return };
-        let Some(&line) = docview::heading_lines(&text).get(idx) else { return };
+        let Some(line) = self.buffer_line_for(path) else { return };
         let Some(iter) = self.buffer.iter_at_line(line as i32) else { return };
         self.view.scroll_to_iter(&mut iter.clone(), 0.0, true, 0.0, 0.08);
     }
@@ -697,9 +804,7 @@ impl App {
 
     /// Put the text cursor at the end of a section's heading and focus it.
     fn put_cursor_at(&self, path: &[usize]) {
-        let text = self.text();
-        let Some(idx) = self.node_index(path) else { return };
-        let Some(&line) = docview::heading_lines(&text).get(idx) else { return };
+        let Some(line) = self.buffer_line_for(path) else { return };
         let Some(mut iter) = self.buffer.iter_at_line(line as i32) else { return };
         if !iter.ends_line() {
             iter.forward_to_line_end();
@@ -763,6 +868,7 @@ impl App {
     }
 
     fn select_path(&self, path: &[usize]) {
+        self.loading.set(true);
         for depth in 1..path.len() {
             if let Some(row) = self.find_row(&path[..depth]).and_then(|i| self.tree.row(i)) {
                 if row.is_expandable() && !row.is_expanded() {
@@ -770,6 +876,7 @@ impl App {
                 }
             }
         }
+        self.loading.set(false);
         if let Some(i) = self.find_row(path) {
             self.selection.set_selected(i);
             *self.selected.borrow_mut() = Some(path.to_vec());
@@ -795,6 +902,9 @@ impl App {
     }
 
     fn run(&self, cmd: Cmd, at: Option<NodePath>) {
+        // Restructuring rewrites the whole buffer, so nothing may be parked.
+        self.unfold_all();
+        self.folds.borrow_mut().clear();
         let mut doc = parse::parse(&self.text());
         let Some(out) = edit::apply(&mut doc, at.as_deref(), cmd) else { return };
 
@@ -1104,7 +1214,7 @@ impl App {
     /// underneath the cursor; only structural commands rewrite the text.
     fn save_doc(&self) {
         let Some(path) = self.path.borrow().clone() else { return };
-        let mut text = self.text();
+        let mut text = self.full_text();
         if !text.ends_with('\n') && !text.is_empty() {
             text.push('\n');
         }
@@ -1122,7 +1232,6 @@ impl App {
     }
 
     fn save_state(&self) {
-        self.capture_collapsed();
         if let Some(path) = self.path.borrow().clone() {
             state::save_doc_state(&path, &self.dstate.borrow());
         }
