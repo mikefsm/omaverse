@@ -11,7 +11,6 @@
 // Nothing consumes this yet: it is the data model the interlinear editor and
 // then the diagrammer are built on, written and tested first because word
 // identity has to be right before anything refers to a word.
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 
@@ -144,13 +143,9 @@ impl Interlinear {
 
     /// Add the words of a pasted passage, keeping anything already here.
     pub fn append_text(&mut self, text: &str) {
-        let mut next = self.words.len() + 1;
         for token in tokenize(text) {
-            while self.word(&format!("w{next}")).is_some() {
-                next += 1;
-            }
-            self.words.push(Word::new(format!("w{next}"), token));
-            next += 1;
+            let id = self.fresh_id();
+            self.words.push(Word::new(id, token));
         }
     }
 }
@@ -239,6 +234,30 @@ mod tests {
         assert_eq!(w.field("lemma"), None);
         w.set_field("gloss", "   ");
         assert_eq!(w.field("gloss"), None, "blanking clears it");
+    }
+
+    #[test]
+    fn editing_a_word_keeps_its_id() {
+        // Diagrams will point at words by id, so an edit must never renumber.
+        let mut sheet = Interlinear::new("Jude 4", Language::Greek);
+        sheet.append_text("alpha beta");
+        let word = sheet.word_mut("w2").expect("the word is there");
+        word.set_field("gloss", "second");
+        word.text = "beta corrected".into();
+        assert_eq!(sheet.words[1].id, "w2");
+        assert_eq!(sheet.word("w2").unwrap().text, "beta corrected");
+    }
+
+    #[test]
+    fn a_field_outside_rows_is_still_kept() {
+        // The editor offers every field; `rows` only decides what is shown.
+        let mut sheet = Interlinear::new("Jude 4", Language::Greek);
+        sheet.rows = vec!["gloss".into()];
+        sheet.append_text("alpha");
+        sheet.word_mut("w1").unwrap().set_field("note", "worth saying");
+        let back = Interlinear::parse(&sheet.to_toml()).expect("should parse");
+        assert_eq!(back.word("w1").unwrap().field("note"), Some("worth saying"));
+        assert_eq!(back.rows, ["gloss"]);
     }
 
     #[test]

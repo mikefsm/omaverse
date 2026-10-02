@@ -344,6 +344,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     }
     {
         let a = app.clone();
+        app.grid.connect_activated(move |id| a.edit_word(&id));
+    }
+    {
+        let a = app.clone();
         buffer.connect_changed(move |_| {
             if !a.loading.get() {
                 a.dirty_doc.set(true);
@@ -632,7 +636,9 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         glib::timeout_add_local(Duration::from_millis(SAVE_DOC_MS), move || {
             if a.dirty_doc.get() && !a.conflict.get() {
                 a.dirty_doc.set(false);
-                a.refresh_structure();
+                if a.sheet.borrow().is_none() {
+                    a.refresh_structure();
+                }
                 a.save_doc();
             }
             glib::ControlFlow::Continue
@@ -2008,18 +2014,21 @@ impl App {
     // ---- documents ---------------------------------------------------------
 
     pub fn open(&self, path: &PathBuf) {
-        if library::kind_of(path) == Some(library::Kind::Interlinear) {
-            self.open_interlinear(path);
-            return;
-        }
+        // Whatever is open goes to disk first, whichever kind is arriving:
+        // autosave is on a timer, so switching can otherwise outrun it.
         if self.path.borrow().is_some() {
             self.save_doc();
             self.save_state();
             self.dirty_doc.set(false);
             self.dirty_state.set(false);
         }
+        if library::kind_of(path) == Some(library::Kind::Interlinear) {
+            self.open_interlinear(path);
+            return;
+        }
 
         let src = std::fs::read_to_string(path).unwrap_or_default();
+        *self.sheet.borrow_mut() = None;
         *self.path.borrow_mut() = Some(path.clone());
         *self.dstate.borrow_mut() = state::load_doc_state(path);
         *self.selected.borrow_mut() = None;
@@ -2170,11 +2179,11 @@ impl App {
             if reference.is_empty() {
                 return;
             }
-            let language = match language.selected() {
-                1 => crate::interlinear::Language::Hebrew,
-                2 => crate::interlinear::Language::Other,
-                _ => crate::interlinear::Language::Greek,
-            };
+            let language = crate::interlinear::Language::of(
+                &language.selected_item().and_then(|i| i.downcast::<gtk::StringObject>().ok())
+                    .map(|s| s.string().to_string())
+                    .unwrap_or_default(),
+            );
             let buffer = passage.buffer();
             let (start, end) = buffer.bounds();
             let text = buffer.text(&start, &end, false).to_string();
@@ -2301,6 +2310,214 @@ impl App {
         self.open(&path);
         if let Some(p) = self.path_at_index(0) {
             self.put_cursor_at(&p);
+        }
+    }
+
+    // ---- editing a word ----------------------------------------------------
+
+    /// The fields a word can carry. The sheet's `rows` decide which are shown
+    /// beneath it in the grid; all of them are editable here, so a field can be
+    /// filled before it is displayed.
+    const WORD_FIELDS: [(&'static str, &'static str); 4] = [
+        ("gloss", "Gloss"),
+        ("lemma", "Lemma"),
+        ("parse", "Parsing"),
+        ("note", "Note"),
+    ];
+
+    fn edit_word(self: &Rc<Self>, id: &str) {
+        let Some(word) = self.sheet.borrow().as_ref().and_then(|s| s.word(id).cloned()) else {
+            return;
+        };
+        let rtl = self
+            .sheet
+            .borrow()
+            .as_ref()
+            .map(|s| s.language.right_to_left())
+            .unwrap_or(false);
+
+        let popover = gtk::Popover::new();
+        popover.set_parent(&self.grid.root);
+        popover.set_autohide(true);
+        if let Some(index) = self.grid.index_of(id) {
+            if let Some(rect) = self.grid.rect_for(index) {
+                popover.set_pointing_to(Some(&rect));
+            }
+        }
+
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        column.set_margin_top(12);
+        column.set_margin_bottom(12);
+        column.set_margin_start(12);
+        column.set_margin_end(12);
+        column.set_size_request(300, -1);
+
+        // The word itself is editable: pasted text carries punctuation and the
+        // occasional join that wants correcting.
+        let text = gtk::Entry::builder().text(&word.text).build();
+        text.add_css_class("oma-word-entry");
+        if rtl {
+            text.set_direction(gtk::TextDirection::Rtl);
+        }
+        gtk::prelude::EditableExt::set_alignment(&text, 0.5);
+        column.append(&text);
+        column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        let mut entries = Vec::new();
+        for (field, label) in Self::WORD_FIELDS {
+            let caption = gtk::Label::new(Some(label));
+            caption.add_css_class("oma-group");
+            caption.set_halign(gtk::Align::Start);
+            column.append(&caption);
+            let entry = gtk::Entry::builder()
+                .text(word.field(field).unwrap_or(""))
+                .activates_default(true)
+                .build();
+            column.append(&entry);
+            entries.push((field, entry));
+        }
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let next = gtk::Button::with_label("Save and next");
+        next.set_hexpand(true);
+        next.set_halign(gtk::Align::End);
+        let done = gtk::Button::with_label("Done");
+        done.add_css_class("suggested-action");
+        actions.append(&next);
+        actions.append(&done);
+        column.append(&actions);
+        popover.set_child(Some(&column));
+
+        let commit = {
+            let me = self.clone();
+            let id = id.to_string();
+            let text = text.clone();
+            let entries = entries.clone();
+            move || {
+                me.apply_word_edit(&id, &text.text(), &entries);
+            }
+        };
+
+        {
+            let commit = commit.clone();
+            let popover = popover.clone();
+            done.connect_clicked(move |_| {
+                commit();
+                popover.popdown();
+            });
+        }
+        {
+            // Working through a passage is the common case, so saving and
+            // stepping on is one button rather than two actions.
+            let commit = commit.clone();
+            let me = self.clone();
+            let id = id.to_string();
+            let popover = popover.clone();
+            next.connect_clicked(move |_| {
+                commit();
+                popover.popdown();
+                me.edit_next_after(&id);
+            });
+        }
+        {
+            // Tab would otherwise walk out of the popover and back into the
+            // grid, so the fields are cycled by hand.
+            let mut ring: Vec<gtk::Entry> = vec![text.clone()];
+            ring.extend(entries.iter().map(|(_, e)| e.clone()));
+
+            let commit = commit.clone();
+            let target = popover.clone();
+            let keys = gtk::EventControllerKey::new();
+            keys.connect_key_pressed(move |_, key, _, mods| {
+                match key {
+                    gdk::Key::Return | gdk::Key::KP_Enter => {
+                        commit();
+                        target.popdown();
+                    }
+                    gdk::Key::Escape => target.popdown(),
+                    gdk::Key::Tab | gdk::Key::ISO_Left_Tab => {
+                        let back = key == gdk::Key::ISO_Left_Tab
+                            || mods.contains(gdk::ModifierType::SHIFT_MASK);
+                        // An entry delegates focus to the text widget inside
+                        // it, so asking the entry itself always says no.
+                        let at = ring
+                            .iter()
+                            .position(|e| e.has_focus() || e.focus_child().is_some())
+                            .unwrap_or(0);
+                        let next = if back {
+                            (at + ring.len() - 1) % ring.len()
+                        } else {
+                            (at + 1) % ring.len()
+                        };
+                        ring[next].grab_focus();
+                    }
+                    _ => return glib::Propagation::Proceed,
+                }
+                glib::Propagation::Stop
+            });
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            popover.add_controller(keys);
+        }
+
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+        let first = entries.first().map(|(_, e)| e.clone());
+        glib::idle_add_local_once(move || {
+            if let Some(entry) = first {
+                entry.grab_focus();
+            }
+        });
+    }
+
+    fn apply_word_edit(&self, id: &str, text: &str, entries: &[(&str, gtk::Entry)]) {
+        {
+            let mut held = self.sheet.borrow_mut();
+            let Some(sheet) = held.as_mut() else { return };
+            let Some(word) = sheet.word_mut(id) else { return };
+            let text = text.trim();
+            if !text.is_empty() {
+                word.text = text.to_string();
+            }
+            for (field, entry) in entries {
+                word.set_field(field, &entry.text());
+            }
+        }
+        if let Some(sheet) = self.sheet.borrow().as_ref() {
+            self.grid.show(sheet);
+        }
+        self.dirty_doc.set(true);
+    }
+
+    /// Move to the word after this one and open it.
+    fn edit_next_after(self: &Rc<Self>, id: &str) {
+        let Some(index) = self.grid.index_of(id) else { return };
+        let next_id = self
+            .sheet
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.words.get(index + 1).map(|w| w.id.clone()));
+        let Some(next_id) = next_id else { return };
+        self.grid.focus_word(index + 1);
+        let me = self.clone();
+        // Let the popover finish closing before the next one opens.
+        glib::idle_add_local_once(move || me.edit_word(&next_id));
+    }
+
+    /// Write the sheet back. Sheets are TOML, so they do not go through the
+    /// Markdown path at all.
+    fn save_sheet(&self, path: &Path) {
+        let Some(sheet) = self.sheet.borrow().as_ref().cloned() else { return };
+        match crate::atomic_write(path, sheet.to_toml().as_bytes()) {
+            Ok(()) => {
+                self.record_stamp(path);
+                self.wtitle.set_subtitle(&self.pretty(path));
+                self.wtitle.remove_css_class("oma-error");
+            }
+            Err(e) => {
+                eprintln!("omaverse: could not save {}: {e}", path.display());
+                self.wtitle.set_subtitle(&format!("Not saved — {e}"));
+                self.wtitle.add_css_class("oma-error");
+            }
         }
     }
 
@@ -2530,6 +2747,10 @@ kept, so neither is lost.",
                 self.wtitle.add_css_class("oma-error");
                 return;
             }
+        }
+        if self.sheet.borrow().is_some() {
+            self.save_sheet(&path);
+            return;
         }
         let mut text = self.full_text();
         if !text.ends_with('\n') && !text.is_empty() {

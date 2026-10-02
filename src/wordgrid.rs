@@ -5,10 +5,6 @@
 //! clicked, annotated, and later picked up and dropped onto a diagram, so this
 //! is a flow of small columns rather than a run of text.
 
-// id_at, connect_activated and rect_for are the hooks the editing step uses to
-// put a popover on a word; the surface is built and seen working first.
-#![allow(dead_code)]
-
 use crate::interlinear::Interlinear;
 use gtk4 as gtk;
 use gtk4::pango;
@@ -93,9 +89,17 @@ impl WordGrid {
         *self.ids.borrow_mut() = ids;
     }
 
-    /// The word id behind a flow child, by its position.
-    pub fn id_at(&self, index: usize) -> Option<String> {
-        self.ids.borrow().get(index).cloned()
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.ids.borrow().iter().position(|w| w == id)
+    }
+
+    /// Put the keyboard on a word, so working through a passage never needs the
+    /// mouse.
+    pub fn focus_word(&self, index: usize) {
+        if let Some(child) = self.flow.child_at_index(index as i32) {
+            self.flow.select_child(&child);
+            child.grab_focus();
+        }
     }
 
     pub fn connect_activated(&self, f: impl Fn(String) + 'static) {
