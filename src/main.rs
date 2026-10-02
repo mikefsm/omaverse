@@ -10,6 +10,7 @@ mod parse;
 mod reference;
 mod spell;
 mod state;
+mod wordgrid;
 mod theme;
 
 use gtk4::gio;

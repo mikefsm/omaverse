@@ -8,7 +8,9 @@
 use crate::config::{self, Config};
 use crate::docview;
 use crate::edit::{self, Cmd};
+use crate::interlinear::Interlinear;
 use crate::library;
+use crate::wordgrid::WordGrid;
 use crate::model::{parse_path_key, path_key, Document, NodePath, Note, NoteKind};
 use crate::nodeobj::NodeObject;
 use crate::parse;
@@ -37,6 +39,9 @@ const WATCH_MS: u64 = 1500;
 const CSS: &str = "
 .oma-doc { font-family: 'SBL BibLit','SBL Hebrew','SBL Greek','Source Serif 4','Noto Serif',serif; font-size: 12.5pt; }
 .oma-outline { font-size: 10.5pt; }
+.oma-word { font-family: 'SBL BibLit','SBL Hebrew','SBL Greek',serif; font-size: 19pt; }
+.oma-annot { font-size: 9.5pt; opacity: 0.8; }
+.oma-annot-empty { opacity: 0.25; }
 .oma-group { font-size: 9pt; font-weight: bold; letter-spacing: 0.04em; }
 .oma-error { color: #e01b24; }
 ";
@@ -94,6 +99,9 @@ pub struct App {
     note_open: Cell<bool>,
     /// The fold triangles drawn beside the text.
     gutter: RefCell<Option<gtk::DrawingArea>>,
+    /// The interlinear surface, shown instead of the outline for a sheet.
+    grid: WordGrid,
+    sheet: RefCell<Option<Interlinear>>,
     /// None when no dictionary is installed; spelling is simply not marked then.
     speller: Option<crate::spell::Speller>,
     /// A section lifted by Cut, waiting to be pasted. Kept here rather than on
@@ -214,9 +222,12 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         .child(&new_from_empty)
         .build();
 
+    let grid = WordGrid::new();
+
     let stack = gtk::Stack::new();
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&paned, Some("doc"));
+    stack.add_named(&grid.root, Some("interlinear"));
     stack.set_visible_child_name("empty");
 
     // ---- library sidebar ---------------------------------------------------
@@ -305,6 +316,8 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         conflict_asked: Cell::new(false),
         note_open: Cell::new(false),
         gutter: RefCell::new(None),
+        grid,
+        sheet: RefCell::new(None),
         speller: crate::spell::Speller::new(),
     });
 
@@ -1967,6 +1980,10 @@ impl App {
     // ---- documents ---------------------------------------------------------
 
     pub fn open(&self, path: &PathBuf) {
+        if library::kind_of(path) == Some(library::Kind::Interlinear) {
+            self.open_interlinear(path);
+            return;
+        }
         if self.path.borrow().is_some() {
             self.save_doc();
             self.save_state();
@@ -2116,6 +2133,38 @@ impl App {
         if let Some(p) = self.path_at_index(0) {
             self.put_cursor_at(&p);
         }
+    }
+
+    /// Open a sheet. It has no outline and no folding; the whole window is the
+    /// passage.
+    fn open_interlinear(&self, path: &PathBuf) {
+        let src = std::fs::read_to_string(path).unwrap_or_default();
+        let sheet = match Interlinear::parse(&src) {
+            Ok(sheet) => sheet,
+            Err(e) => {
+                eprintln!("omaverse: {} is not a readable sheet: {e}", path.display());
+                self.wtitle.set_subtitle(&format!("Could not read — {e}"));
+                self.wtitle.add_css_class("oma-error");
+                return;
+            }
+        };
+        *self.path.borrow_mut() = Some(path.clone());
+        self.record_stamp(path);
+        self.conflict.set(false);
+
+        self.wtitle.set_title(&sheet.reference);
+        self.wtitle.set_subtitle(&self.pretty(path));
+        self.wtitle.remove_css_class("oma-error");
+        self.window
+            .set_title(Some(&format!("{} — Omaverse", sheet.reference)));
+
+        self.grid.show(&sheet);
+        *self.sheet.borrow_mut() = Some(sheet);
+        self.stack.set_visible_child_name("interlinear");
+        self.split.set_show_sidebar(true);
+
+        state::push_recent(&mut self.recent.borrow_mut(), path);
+        self.save_window_state();
     }
 
     fn pretty(&self, path: &Path) -> String {

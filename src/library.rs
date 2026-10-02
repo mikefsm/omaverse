@@ -4,10 +4,27 @@
 
 use std::path::{Path, PathBuf};
 
+/// What kind of document a file holds. The extension says it: an outline is
+/// prose, an interlinear is a record set, and they are not the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Outline,
+    Interlinear,
+}
+
+pub fn kind_of(path: &Path) -> Option<Kind> {
+    match path.extension()?.to_str()? {
+        "md" => Some(Kind::Outline),
+        "toml" => Some(Kind::Interlinear),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub path: PathBuf,
     pub title: String,
+    pub kind: Kind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +38,18 @@ pub struct Group {
 /// filename. Only the head of the file is read.
 pub fn title_of(path: &Path) -> String {
     if let Ok(s) = read_head(path, 4096) {
+        if kind_of(path) == Some(Kind::Interlinear) {
+            for line in s.lines().take(10) {
+                if let Some(rest) = line.trim().strip_prefix("reference") {
+                    if let Some(value) = rest.trim().strip_prefix('=') {
+                        let value = value.trim().trim_matches('"').trim();
+                        if !value.is_empty() {
+                            return value.to_string();
+                        }
+                    }
+                }
+            }
+        }
         for line in s.lines().take(20) {
             if let Some(rest) = line.strip_prefix("# ") {
                 let t = rest.trim();
@@ -93,8 +122,8 @@ fn collect(
         }
         if path.is_dir() {
             collect(root, &path, depth + 1, ungrouped, groups);
-        } else if path.extension().map(|x| x == "md").unwrap_or(false) {
-            let entry = Entry { title: title_of(&path), path: path.clone() };
+        } else if let Some(kind) = kind_of(&path) {
+            let entry = Entry { title: title_of(&path), path: path.clone(), kind };
             // Group by the first path component below the root.
             match path.strip_prefix(root).ok().and_then(|r| r.parent()).and_then(|p| p.components().next()) {
                 Some(c) => {
