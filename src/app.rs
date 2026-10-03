@@ -279,6 +279,9 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         .tooltip_text("New document")
         .menu_model(&new_menu)
         .build();
+    let find_btn = gtk::Button::from_icon_name("edit-find-symbolic");
+    find_btn.set_tooltip_text(Some("Search every document (Ctrl+F)"));
+
     let open_btn = gtk::Button::from_icon_name("document-open-symbolic");
     open_btn.set_tooltip_text(Some("Open an outline (Ctrl+O)"));
     let sb_header = adw::HeaderBar::new();
@@ -286,6 +289,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     sb_header.set_show_end_title_buttons(false);
     sb_header.pack_end(&new_btn);
     sb_header.pack_start(&open_btn);
+    sb_header.pack_start(&find_btn);
     let sidebar = adw::ToolbarView::new();
     sidebar.add_top_bar(&sb_header);
     sidebar.set_content(Some(&lib_scroll));
@@ -673,6 +677,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
                 // view and the outline where it used to live: the diagram
                 // canvas is neither of those, and the keys should mean the same
                 // thing whichever view is showing.
+                gdk::Key::f | gdk::Key::F => {
+                    a.show_search();
+                    glib::Propagation::Stop
+                }
                 gdk::Key::r | gdk::Key::R => {
                     let anchor = a.related_btn.clone();
                     a.show_related(anchor.upcast_ref::<gtk::Widget>());
@@ -740,6 +748,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         related_btn.connect_clicked(move |b| a.show_related(b.upcast_ref::<gtk::Widget>()));
+    }
+    {
+        let a = app.clone();
+        find_btn.connect_clicked(move |_| a.show_search());
     }
     {
         let a = app.clone();
@@ -2949,6 +2961,139 @@ impl App {
             return;
         };
         self.confirm_trash(&path);
+    }
+
+    // ---- searching the library ---------------------------------------------
+
+    /// Open a document and put the cursor on a line. Used by search, where the
+    /// answer is not the document but the place in it.
+    fn open_at(self: &Rc<Self>, path: &PathBuf, line: Option<usize>) {
+        self.open(path);
+        let Some(line) = line else { return };
+        // After opening, the buffer is rebuilt on an idle pass; wait for it.
+        let me = self.clone();
+        glib::idle_add_local_once(move || {
+            let buffer = &me.buffer;
+            let at = buffer
+                .iter_at_line(line as i32)
+                .unwrap_or_else(|| buffer.end_iter());
+            buffer.place_cursor(&at);
+            me.view.scroll_to_iter(&mut at.clone(), 0.1, true, 0.0, 0.35);
+            me.view.grab_focus();
+            me.dirty_cursor.set(true);
+        });
+    }
+
+    fn show_search(self: &Rc<Self>) {
+        let dialog = adw::Dialog::new();
+        dialog.set_title("Search");
+        dialog.set_content_width(560);
+        dialog.set_content_height(520);
+
+        let header = adw::HeaderBar::new();
+        let entry = gtk::SearchEntry::new();
+        entry.set_placeholder_text(Some("Find in every document"));
+        entry.set_hexpand(true);
+        header.set_title_widget(Some(&entry));
+
+        let results = gtk::ListBox::new();
+        results.add_css_class("boxed-list");
+        results.set_margin_top(10);
+        results.set_margin_bottom(10);
+        results.set_margin_start(10);
+        results.set_margin_end(10);
+        results.set_valign(gtk::Align::Start);
+
+        let empty = adw::StatusPage::builder()
+            .icon_name("edit-find-symbolic")
+            .title("Search your library")
+            .description("Prose, glosses and the words on a diagram.")
+            .build();
+
+        let stack = gtk::Stack::new();
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&results)
+            .build();
+        stack.add_named(&empty, Some("empty"));
+        stack.add_named(&scroller, Some("results"));
+        stack.set_visible_child_name("empty");
+
+        let shell = adw::ToolbarView::new();
+        shell.add_top_bar(&header);
+        shell.set_content(Some(&stack));
+        dialog.set_child(Some(&shell));
+
+        {
+            let me = self.clone();
+            let results = results.clone();
+            let stack = stack.clone();
+            let empty = empty.clone();
+            let dialog = dialog.clone();
+            entry.connect_search_changed(move |e| {
+                while let Some(row) = results.row_at_index(0) {
+                    results.remove(&row);
+                }
+                let query = e.text().to_string();
+                if query.trim().is_empty() {
+                    empty.set_title("Search your library");
+                    empty.set_description(Some("Prose, glosses and the words on a diagram."));
+                    stack.set_visible_child_name("empty");
+                    return;
+                }
+                let hits = library::search(&me.cfg.borrow().outline_dir, &query);
+                if hits.is_empty() {
+                    empty.set_title("Nothing found");
+                    empty.set_description(Some(&format!("No document contains “{query}”.")));
+                    stack.set_visible_child_name("empty");
+                    return;
+                }
+                // Enough to answer the question; more than this is a list to
+                // scroll rather than an answer.
+                for hit in hits.iter().take(200) {
+                    let row = adw::ActionRow::builder()
+                        .title(glib::markup_escape_text(&hit.context))
+                        .subtitle(match hit.kind {
+                            library::Kind::Outline => hit.title.clone(),
+                            library::Kind::Interlinear => format!("{} — interlinear", hit.title),
+                            library::Kind::Diagram => format!("{} — diagram", hit.title),
+                        })
+                        .activatable(true)
+                        .build();
+                    let me = me.clone();
+                    let dialog = dialog.clone();
+                    let path = hit.path.clone();
+                    let line = hit.line;
+                    row.connect_activated(move |_| {
+                        dialog.close();
+                        me.open_at(&path, line);
+                    });
+                    results.append(&row);
+                }
+                let shown = hits.len().min(200);
+                empty.set_title("Nothing found");
+                stack.set_visible_child_name("results");
+                let _ = shown;
+            });
+        }
+        {
+            let shut = dialog.clone();
+            let keys = gtk::EventControllerKey::new();
+            keys.connect_key_pressed(move |_, key, _, _| {
+                if key == gdk::Key::Escape {
+                    shut.close();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+            dialog.add_controller(keys);
+        }
+
+        dialog.present(Some(&self.window));
+        entry.grab_focus();
     }
 
     // ---- what else covers this passage -------------------------------------

@@ -268,6 +268,135 @@ pub fn related(all: &[Covered], to: &Reference, from: &Path) -> Vec<Covered> {
     found
 }
 
+
+/// Somewhere a search term turned up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub path: PathBuf,
+    pub kind: Kind,
+    pub title: String,
+    /// Where to put the cursor on opening, for documents that have lines.
+    pub line: Option<usize>,
+    /// The words around the match, for showing in a list.
+    pub context: String,
+}
+
+/// Find a run of characters anywhere in the library.
+///
+/// Matching is case-insensitive and on plain substrings: Greek and Hebrew are
+/// searched by the letters you type, which is what you have to hand when the
+/// word is in front of you. Interlinears and diagrams are searched as the
+/// records they are, not as the TOML they are stored in, so a search never
+/// matches a key name or an id.
+pub fn search(root: &Path, query: &str) -> Vec<Hit> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for group in scan(root) {
+        for entry in group.entries {
+            search_one(&entry, &needle, &mut out);
+        }
+    }
+    out
+}
+
+fn search_one(entry: &Entry, needle: &str, out: &mut Vec<Hit>) {
+    let Ok(text) = std::fs::read_to_string(&entry.path) else { return };
+    match entry.kind {
+        Kind::Outline => {
+            let kinds = crate::docview::classify(&text);
+            for (i, line) in text.lines().enumerate() {
+                // The frontmatter is bookkeeping and a reference marker is a
+                // label; neither is the document's text.
+                if matches!(
+                    kinds.get(i),
+                    Some(crate::docview::Line::Front) | Some(crate::docview::Line::Ref)
+                ) {
+                    continue;
+                }
+                // A heading is shown as it reads, not as it is written.
+                let shown = match kinds.get(i) {
+                    Some(crate::docview::Line::Heading { marker, .. }) => {
+                        line.get(*marker..).unwrap_or(line)
+                    }
+                    _ => line,
+                };
+                if shown.to_lowercase().contains(needle) {
+                    out.push(Hit {
+                        path: entry.path.clone(),
+                        kind: entry.kind,
+                        title: entry.title.clone(),
+                        line: Some(i),
+                        context: around(shown, needle),
+                    });
+                }
+            }
+        }
+        Kind::Interlinear => {
+            let Ok(sheet) = crate::interlinear::Interlinear::parse(&text) else { return };
+            for word in &sheet.words {
+                let mut parts = vec![word.text.clone()];
+                parts.extend(
+                    ["gloss", "lemma", "parse", "note"]
+                        .iter()
+                        .filter_map(|f| word.field(f).map(|v| v.to_string())),
+                );
+                let joined = parts.join("  ");
+                if joined.to_lowercase().contains(needle) {
+                    out.push(Hit {
+                        path: entry.path.clone(),
+                        kind: entry.kind,
+                        title: entry.title.clone(),
+                        line: None,
+                        context: joined,
+                    });
+                }
+            }
+        }
+        Kind::Diagram => {
+            let Ok(diagram) = crate::diagram::Diagram::parse(&text) else { return };
+            for label in &diagram.labels {
+                if label.text.to_lowercase().contains(needle) {
+                    out.push(Hit {
+                        path: entry.path.clone(),
+                        kind: entry.kind,
+                        title: entry.title.clone(),
+                        line: None,
+                        context: label.text.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Enough of the line to recognise the match, centred on it.
+fn around(line: &str, needle: &str) -> String {
+    const REACH: usize = 48;
+    let hay = line.to_lowercase();
+    let Some(at) = hay.find(needle) else { return line.trim().to_string() };
+    // Byte offsets from `find` land on character boundaries of the lowercased
+    // text; step out to boundaries of the original before slicing.
+    let start = (0..=at.saturating_sub(REACH))
+        .rev()
+        .find(|i| line.is_char_boundary(*i))
+        .unwrap_or(0);
+    let want = (at + needle.len() + REACH).min(line.len());
+    let end = (want..=line.len())
+        .find(|i| line.is_char_boundary(*i))
+        .unwrap_or(line.len());
+    let mut s = line[start..end].trim().to_string();
+    if start > 0 {
+        s.insert(0, '…');
+    }
+    if end < line.len() {
+        s.push('…');
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +508,90 @@ mod tests {
         let elsewhere = Reference::parse("Romans 4").unwrap();
         assert!(related(&all, &elsewhere, &d.join("nothing.md")).is_empty());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    fn searchable(name: &str) -> PathBuf {
+        let d = tmp(name);
+        std::fs::write(
+            d.join("jude.md"),
+            r#"---
+title: Jude
+---
+
+# Greeting
+<!-- ref: 1-2 -->
+
+Beloved in God the Father, and kept for Jesus Christ.
+
+## Mercy
+
+Mercy to you, and peace, and love.
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("sheet.toml"),
+            "reference = \"Jude 2\"\nlanguage = \"greek\"\n\n[[words]]\nid = \"w1\"\n             text = \"\u{3b5}\u{1f30}\u{3c1}\u{3ae}\u{3bd}\u{3b7}\"\ngloss = \"peace\"\n",
+        )
+        .unwrap();
+        d
+    }
+
+    #[test]
+    fn search_finds_prose_and_gives_the_line_to_open_at() {
+        let d = searchable("search");
+        let hits = search(&d, "beloved");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Jude");
+        assert_eq!(hits[0].line, Some(7), "the line it is on");
+        assert!(hits[0].context.contains("Beloved"), "got {}", hits[0].context);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn search_reads_a_sheet_as_words_not_as_toml() {
+        let d = searchable("searchsheet");
+        // A gloss is findable.
+        let hits = search(&d, "peace");
+        let kinds: Vec<Kind> = hits.iter().map(|h| h.kind).collect();
+        assert!(kinds.contains(&Kind::Interlinear), "the sheet's gloss");
+        assert!(kinds.contains(&Kind::Outline), "and the prose");
+
+        // The Greek itself is findable by its own letters.
+        let hits = search(&d, "\u{3b5}\u{1f30}\u{3c1}");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, Kind::Interlinear);
+
+        // Key names and ids are not text.
+        assert!(search(&d, "language").is_empty(), "a TOML key is not content");
+        assert!(search(&d, "w1").is_empty(), "nor is a word id");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn search_ignores_case_and_apparatus_and_empty_queries() {
+        let d = searchable("searchcase");
+        let hits = search(&d, "MERCY");
+        assert_eq!(hits.len(), 2, "heading and prose, either case");
+        assert!(
+            hits.iter().all(|h| !h.context.starts_with('#')),
+            "a heading reads as it reads, not as it is written"
+        );
+        assert!(search(&d, "   ").is_empty(), "an empty query finds nothing");
+        // The reference marker and the frontmatter are not the document's text.
+        assert!(search(&d, "ref:").is_empty());
+        assert!(search(&d, "title:").is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn context_is_trimmed_around_the_match_on_character_boundaries() {
+        let long = format!("{}\u{3b1}\u{3b2}\u{3b3} needle \u{3b4}\u{3b5}{}", "x".repeat(200), "y".repeat(200));
+        let out = around(&long, "needle");
+        assert!(out.starts_with('\u{2026}') && out.ends_with('\u{2026}'), "got {out}");
+        assert!(out.contains("needle"));
+        assert!(out.chars().count() < 120);
     }
 
     #[test]
