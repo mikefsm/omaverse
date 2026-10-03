@@ -1,4 +1,4 @@
-# Maintainer: Mike Smith <mike@example.com>
+# Maintainer: Michael Prince <mike@graceforsuffolk.org>
 #
 # Tracks the latest commit. Rename to PKGBUILD in its own AUR repository named
 # `omaverse-git`; the release package lives beside this one.

@@ -1,13 +1,12 @@
-# Maintainer: Mike Smith <mike@example.com>
+# Maintainer: Michael Prince <mike@graceforsuffolk.org>
 #
 # Release package: builds the tagged version from the repository.
 # For a package that tracks the latest commit, see PKGBUILD-git beside this.
 #
 # Before the first upload:
-#   1. Create the repository at the `url` below and push a `v0.1.0` tag.
-#   2. Put your real name and address in the Maintainer line.
-#   3. makepkg --printsrcinfo > .SRCINFO
-#   4. makepkg -si    # builds, runs the test suite, installs
+#   1. makepkg -si              # builds, runs the test suite, installs
+#   2. makepkg --printsrcinfo > .SRCINFO
+#   3. push PKGBUILD and .SRCINFO to ssh://aur@aur.archlinux.org/omaverse.git
 
 pkgname=omaverse
 pkgver=0.1.0
