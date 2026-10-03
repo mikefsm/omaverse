@@ -687,6 +687,24 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
                 // view and the outline where it used to live: the diagram
                 // canvas is neither of those, and the keys should mean the same
                 // thing whichever view is showing.
+                gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add
+                    if a.canvas.is_open() =>
+                {
+                    a.canvas.zoom_by(Canvas::ZOOM_STEP);
+                    glib::Propagation::Stop
+                }
+                gdk::Key::minus | gdk::Key::KP_Subtract if a.canvas.is_open() => {
+                    a.canvas.zoom_by(1.0 / Canvas::ZOOM_STEP);
+                    glib::Propagation::Stop
+                }
+                gdk::Key::_0 | gdk::Key::KP_0 if a.canvas.is_open() => {
+                    a.canvas.zoom_actual();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::_9 | gdk::Key::KP_9 if a.canvas.is_open() => {
+                    a.canvas.zoom_fit();
+                    glib::Propagation::Stop
+                }
                 gdk::Key::f | gdk::Key::F => {
                     a.show_search();
                     glib::Propagation::Stop

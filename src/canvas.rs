@@ -17,6 +17,11 @@ use std::rc::Rc;
 const GRAB: f64 = 9.0;
 /// How close a stroke or word has to come to rest for it to be held there.
 const SNAP: f64 = 16.0;
+/// How far the canvas will zoom, and the step a key press takes.
+const ZOOM_MIN: f64 = 0.25;
+const ZOOM_MAX: f64 = 4.0;
+const ZOOM_STEP: f64 = 1.25;
+
 /// How far back undo reaches. A diagram is small enough that keeping whole
 /// copies is simpler, and cheaper, than working out how to reverse each change.
 const HISTORY: usize = 120;
@@ -35,10 +40,11 @@ pub enum Sel {
 #[derive(Debug, Clone)]
 enum Drag {
     None,
-    /// Moves are applied as the change since the last report, so whatever is
-    /// held by what is moving comes along with it.
-    MoveLabel { id: String, dx: f64, dy: f64 },
-    MoveLine { id: String, dx: f64, dy: f64 },
+    /// Each carries where the pointer was last seen, in the diagram's own
+    /// units. Moves are applied as the change since then, so whatever is held
+    /// by what is moving comes along with it.
+    MoveLabel { id: String, at: (f64, f64) },
+    MoveLine { id: String, at: (f64, f64) },
     MoveEnd { id: String, end: End },
 }
 
@@ -64,6 +70,10 @@ pub struct Canvas {
     on_change: Rc<RefCell<Option<Box<dyn Fn()>>>>,
     rtl: Rc<Cell<bool>>,
     history: Rc<RefCell<History>>,
+    /// How much bigger than its own units the canvas is drawn.
+    zoom: Rc<Cell<f64>>,
+    /// The window onto the canvas, which is what "fit" has to fit inside.
+    scroller: gtk::ScrolledWindow,
     /// Shown only when the diagram remembers the sheet it came from.
     resync: gtk::Button,
     /// Live only while something held is selected, so it says what is attached.
@@ -80,6 +90,7 @@ impl Canvas {
         let on_change: Rc<RefCell<Option<Box<dyn Fn()>>>> = Rc::new(RefCell::new(None));
         let rtl = Rc::new(Cell::new(false));
         let history: Rc<RefCell<History>> = Rc::new(RefCell::new(History::default()));
+        let zoom = Rc::new(Cell::new(1.0));
 
         let area = gtk::DrawingArea::builder()
             .content_width(WIDTH)
@@ -89,6 +100,10 @@ impl Canvas {
         area.add_css_class("oma-canvas");
 
         let scroller = gtk::ScrolledWindow::builder().vexpand(true).child(&area).build();
+        // Scrolling must land where it is put rather than gliding there: a
+        // glide still running underneath a drag moves the canvas out from
+        // under the pointer, and every coordinate is relative to the canvas.
+        scroller.set_kinetic_scrolling(false);
 
         // ---- palette -------------------------------------------------------
         let palette = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -143,6 +158,35 @@ impl Canvas {
         let delete = gtk::Button::from_icon_name("user-trash-symbolic");
         delete.set_tooltip_text(Some("Remove what is selected (Delete)"));
         palette.append(&delete);
+
+        // One slot in the palette rather than three: the row is already full,
+        // and zoom is reached occasionally rather than per stroke.
+        let zoom_out = gtk::Button::from_icon_name("zoom-out-symbolic");
+        zoom_out.set_tooltip_text(Some("Zoom out (Ctrl+-)"));
+        let zoom_fit = gtk::Button::from_icon_name("zoom-fit-best-symbolic");
+        zoom_fit.set_tooltip_text(Some("Fit the whole diagram (Ctrl+9)"));
+        let zoom_in = gtk::Button::from_icon_name("zoom-in-symbolic");
+        zoom_in.set_tooltip_text(Some("Zoom in (Ctrl++)"));
+        let zoom_one = gtk::Button::with_label("100%");
+        zoom_one.set_tooltip_text(Some("Actual size (Ctrl+0)"));
+
+        let zoom_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        zoom_row.set_margin_top(6);
+        zoom_row.set_margin_bottom(6);
+        zoom_row.set_margin_start(6);
+        zoom_row.set_margin_end(6);
+        zoom_row.append(&zoom_out);
+        zoom_row.append(&zoom_one);
+        zoom_row.append(&zoom_in);
+        zoom_row.append(&zoom_fit);
+        let zoom_pop = gtk::Popover::new();
+        zoom_pop.set_child(Some(&zoom_row));
+        let zoom_btn = gtk::MenuButton::builder()
+            .icon_name("zoom-fit-best-symbolic")
+            .tooltip_text("Zoom")
+            .popover(&zoom_pop)
+            .build();
+        palette.append(&zoom_btn);
 
         let resync = gtk::Button::from_icon_name("view-refresh-symbolic");
         resync.set_tooltip_text(Some(
@@ -207,6 +251,8 @@ impl Canvas {
             on_change: on_change.clone(),
             rtl: rtl.clone(),
             history: history.clone(),
+            zoom: zoom.clone(),
+            scroller: scroller.clone(),
             resync: resync.clone(),
             detach: detach.clone(),
         };
@@ -216,6 +262,22 @@ impl Canvas {
         canvas.wire_keys();
         canvas.wire_drop();
 
+        {
+            let c = canvas.handle();
+            zoom_in.connect_clicked(move |_| c.set_zoom(c.zoom.get() * ZOOM_STEP));
+        }
+        {
+            let c = canvas.handle();
+            zoom_out.connect_clicked(move |_| c.set_zoom(c.zoom.get() / ZOOM_STEP));
+        }
+        {
+            let c = canvas.handle();
+            zoom_fit.connect_clicked(move |_| c.fit());
+        }
+        {
+            let c = canvas.handle();
+            zoom_one.connect_clicked(move |_| c.set_zoom(1.0));
+        }
         {
             let c = canvas.handle();
             detach.connect_clicked(move |_| c.detach_selected());
@@ -245,6 +307,8 @@ impl Canvas {
             on_change: self.on_change.clone(),
             rtl: self.rtl.clone(),
             history: self.history.clone(),
+            zoom: self.zoom.clone(),
+            scroller: self.scroller.clone(),
             detach: self.detach.clone(),
         }
     }
@@ -281,6 +345,7 @@ impl Canvas {
     }
 
     pub fn show(&self, diagram: Diagram, rtl: bool) {
+        self.handle().set_zoom(1.0);
         self.rtl.set(rtl);
         *self.sel.borrow_mut() = None;
         *self.history.borrow_mut() = History::default();
@@ -299,6 +364,23 @@ impl Canvas {
     pub fn is_open(&self) -> bool {
         self.doc.borrow().is_some()
     }
+
+    /// Zoom by a step, to actual size, or to fit. Driven from the window, which
+    /// hears the keys wherever focus happens to be.
+    pub fn zoom_by(&self, factor: f64) {
+        let h = self.handle();
+        h.set_zoom(self.zoom.get() * factor);
+    }
+
+    pub fn zoom_actual(&self) {
+        self.handle().set_zoom(1.0);
+    }
+
+    pub fn zoom_fit(&self) {
+        self.handle().fit();
+    }
+
+    pub const ZOOM_STEP: f64 = ZOOM_STEP;
 
     pub fn undo(&self) {
         self.handle().step(true);
@@ -320,7 +402,10 @@ impl Canvas {
         let doc = self.doc.clone();
         let rects = self.rects.clone();
         let sel = self.sel.clone();
+        let zoom = self.zoom.clone();
         self.area.set_draw_func(move |area, cr, _w, _h| {
+            let scale = zoom.get();
+            cr.scale(scale, scale);
             let held = doc.borrow();
             let Some(d) = held.as_ref() else {
                 rects.borrow_mut().clear();
@@ -412,6 +497,7 @@ impl Canvas {
         let c = self.handle();
         let palette: Vec<gtk::ToggleButton> = buttons.iter().map(|(_, b)| b.clone()).collect();
         gesture.connect_drag_begin(move |g, x, y| {
+            let (x, y) = c.at(x, y);
             g.widget().map(|w| w.grab_focus());
             if let Some(preset) = c.armed.take() {
                 for b in &palette {
@@ -424,7 +510,7 @@ impl Canvas {
                     d.add_line(preset, x, y)
                 };
                 // Carry on dragging it into place in the same gesture.
-                *c.drag.borrow_mut() = Drag::MoveLine { id: id.clone(), dx: 0.0, dy: 0.0 };
+                *c.drag.borrow_mut() = Drag::MoveLine { id: id.clone(), at: (x, y) };
                 *c.sel.borrow_mut() = Some(Sel::Line(id));
                 c.changed();
                 return;
@@ -444,19 +530,24 @@ impl Canvas {
         });
 
         let c = self.handle();
-        gesture.connect_drag_update(move |g, dx, dy| {
-            let Some((sx, sy)) = g.start_point() else { return };
+        gesture.connect_drag_update(move |g, _, _| {
+            // Where the pointer actually is, rather than how far the gesture
+            // reports it has come: that offset is measured against the viewport
+            // while everything here is in the canvas's own coordinates, and the
+            // two differ by however far the canvas is scrolled.
+            let Some((px, py)) = g.point(None) else { return };
+            let (px, py) = c.at(px, py);
             let job = c.drag.borrow().clone();
             {
                 let mut held = c.doc.borrow_mut();
                 let Some(d) = held.as_mut() else { return };
                 match job {
                     Drag::None => return,
-                    Drag::MoveLabel { id, dx: px, dy: py } => {
+                    Drag::MoveLabel { id, at } => {
                         // A word on a stroke slides along it, so a small drag
                         // adjusts its place rather than tearing it off. Pull
                         // further than that and it comes away.
-                        let (step_x, step_y) = (dx - px, dy - py);
+                        let (step_x, step_y) = (px - at.0, py - at.1);
                         let Some((ax, ay, _)) = d.label(&id).map(|l| d.anchor_of(l)) else {
                             return;
                         };
@@ -485,22 +576,22 @@ impl Canvas {
                                 }
                             }
                         }
-                        *c.drag.borrow_mut() = Drag::MoveLabel { id, dx, dy };
+                        *c.drag.borrow_mut() = Drag::MoveLabel { id, at: (px, py) };
                     }
-                    Drag::MoveLine { id, dx: px, dy: py } => {
-                        d.shift_line(&id, dx - px, dy - py);
-                        *c.drag.borrow_mut() = Drag::MoveLine { id, dx, dy };
+                    Drag::MoveLine { id, at } => {
+                        d.shift_line(&id, px - at.0, py - at.1);
+                        *c.drag.borrow_mut() = Drag::MoveLine { id, at: (px, py) };
                     }
                     Drag::MoveEnd { id, end } => {
                         if let Some(l) = d.line_mut(&id) {
                             match end {
                                 End::First => {
-                                    l.x1 = sx + dx;
-                                    l.y1 = sy + dy;
+                                    l.x1 = px;
+                                    l.y1 = py;
                                 }
                                 End::Second => {
-                                    l.x2 = sx + dx;
-                                    l.y2 = sy + dy;
+                                    l.x2 = px;
+                                    l.y2 = py;
                                 }
                             }
                         }
@@ -582,6 +673,7 @@ impl Canvas {
             let Ok(word_id) = value.get::<String>() else {
                 return false;
             };
+            let (x, y) = c.at(x, y);
             c.checkpoint();
             let placed = {
                 let mut held = c.doc.borrow_mut();
@@ -619,6 +711,8 @@ struct Handle {
     on_change: Rc<RefCell<Option<Box<dyn Fn()>>>>,
     rtl: Rc<Cell<bool>>,
     history: Rc<RefCell<History>>,
+    zoom: Rc<Cell<f64>>,
+    scroller: gtk::ScrolledWindow,
     detach: gtk::Button,
 }
 
@@ -662,12 +756,78 @@ impl Handle {
         }
     }
 
+    /// Where a pointer position falls in the diagram's own units.
+    fn at(&self, x: f64, y: f64) -> (f64, f64) {
+        let scale = self.zoom.get();
+        (x / scale, y / scale)
+    }
+
+    /// Zoom about the middle of what is on screen, so the drawing does not
+    /// slide out from under the pointer.
+    fn set_zoom(&self, to: f64) {
+        let scale = to.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (scale - self.zoom.get()).abs() < f64::EPSILON {
+            return;
+        }
+        self.zoom.set(scale);
+        self.area.set_content_width((WIDTH as f64 * scale) as i32);
+        self.area.set_content_height((HEIGHT as f64 * scale) as i32);
+        self.area.queue_draw();
+    }
+
+    /// Scale so the whole drawing is on screen at once.
+    fn fit(&self) {
+        let held = self.doc.borrow();
+        let Some(d) = held.as_ref() else { return };
+        let mut bounds: Option<(f64, f64, f64, f64)> = None;
+        let mut stretch = |x: f64, y: f64| {
+            bounds = Some(match bounds {
+                None => (x, y, x, y),
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+            });
+        };
+        for line in &d.lines {
+            stretch(line.x1, line.y1);
+            stretch(line.x2, line.y2);
+        }
+        for label in &d.labels {
+            let (x, y, _) = d.anchor_of(label);
+            stretch(x - 40.0, y - 20.0);
+            stretch(x + 40.0, y + 8.0);
+        }
+        drop(held);
+        let Some((x0, y0, x1, y1)) = bounds else { return };
+        let (vw, vh) = (self.scroller.width() as f64, self.scroller.height() as f64);
+        if vw < 1.0 || vh < 1.0 {
+            return;
+        }
+        let margin = 48.0;
+        let scale = ((vw - margin) / (x1 - x0).max(1.0)).min((vh - margin) / (y1 - y0).max(1.0));
+        self.set_zoom(scale);
+
+        // Scaling alone is not fitting: the drawing has to be brought into
+        // view as well. The new size request has to be taken up first, so this
+        // waits a turn.
+        let scroller = self.scroller.clone();
+        let scale = self.zoom.get();
+        glib::idle_add_local_once(move || {
+            let (w, h) = (scroller.width() as f64, scroller.height() as f64);
+            let (dw, dh) = ((x1 - x0) * scale, (y1 - y0) * scale);
+            scroller
+                .hadjustment()
+                .set_value((x0 * scale - (w - dw).max(0.0) / 2.0).max(0.0));
+            scroller
+                .vadjustment()
+                .set_value((y0 * scale - (h - dh).max(0.0) / 2.0).max(0.0));
+        });
+    }
+
     /// What the pointer has taken hold of. Labels win over lines, because a
     /// word usually sits on one.
     fn pick(&self, x: f64, y: f64) -> Drag {
         for (id, rx, ry, rw, rh) in self.rects.borrow().iter().rev() {
             if x >= *rx && x <= rx + rw && y >= *ry && y <= ry + rh {
-                return Drag::MoveLabel { id: id.clone(), dx: 0.0, dy: 0.0 };
+                return Drag::MoveLabel { id: id.clone(), at: (x, y) };
             }
         }
         let held = self.doc.borrow();
@@ -676,7 +836,7 @@ impl Handle {
         if let Some(end) = d.end_at(line, x, y, GRAB) {
             return Drag::MoveEnd { id: line.id.clone(), end };
         }
-        Drag::MoveLine { id: line.id.clone(), dx: 0.0, dy: 0.0 }
+        Drag::MoveLine { id: line.id.clone(), at: (x, y) }
     }
 
     /// Let go of whatever is selected without moving it. Dragging something
