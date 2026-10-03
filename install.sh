@@ -7,6 +7,7 @@ APP=org.mikefsm.omaverse
 BIN="${HOME}/.local/bin"
 APPS="${HOME}/.local/share/applications"
 ICONS="${HOME}/.local/share/icons/hicolor/scalable/apps"
+META="${HOME}/.local/share/metainfo"
 
 echo "Building..."
 cargo build --release
@@ -14,6 +15,7 @@ cargo build --release
 install -Dm755 target/release/omaverse "${BIN}/omaverse"
 install -Dm644 "data/${APP}.desktop" "${APPS}/${APP}.desktop"
 install -Dm644 "data/${APP}.svg"     "${ICONS}/${APP}.svg"
+install -Dm644 "data/${APP}.metainfo.xml" "${META}/${APP}.metainfo.xml"
 
 update-desktop-database "${APPS}" 2>/dev/null || true
 gtk4-update-icon-cache -qtf "${HOME}/.local/share/icons/hicolor" 2>/dev/null \
@@ -24,6 +26,7 @@ echo "Installed:"
 echo "  ${BIN}/omaverse"
 echo "  ${APPS}/${APP}.desktop"
 echo "  ${ICONS}/${APP}.svg"
+echo "  ${META}/${APP}.metainfo.xml"
 
 case ":${PATH}:" in
   *":${BIN}:"*) ;;

@@ -11,10 +11,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config {
-            outline_dir: crate::state::home()
-                .join("Dropbox/Documents/Biblical Studies/Outlines"),
-        }
+        Config { outline_dir: crate::state::home().join("Documents/Omaverse") }
     }
 }
 
@@ -36,17 +33,45 @@ pub fn load() -> Config {
         }),
         Err(_) => {
             let cfg = Config::default();
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let body = format!(
-                "# omaverse configuration\n\
-                 # Directory scanned for outlines. Subfolders become sidebar groups.\n\
-                 outline_dir = {}\n",
-                toml::Value::from(cfg.outline_dir.to_string_lossy().to_string())
-            );
-            let _ = std::fs::write(&path, body);
+            // First run: make the folder as well as the file. An empty library
+            // pointing at a directory that does not exist is a poor welcome,
+            // and the alternative is every new user editing TOML before they
+            // can write anything.
+            let _ = std::fs::create_dir_all(&cfg.outline_dir);
+            cfg.save();
             cfg
         }
+    }
+}
+
+impl Config {
+    pub fn save(&self) {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = format!(
+            "# omaverse configuration\n\
+             # Directory scanned for outlines. Subfolders become sidebar groups.\n\
+             # Changeable from the app: the document menu, \"Library folder…\".\n\
+             outline_dir = {}\n",
+            toml::Value::from(self.outline_dir.to_string_lossy().to_string())
+        );
+        if let Err(e) = crate::atomic_write(&path, body.as_bytes()) {
+            eprintln!("omaverse: could not save {}: {e}", path.display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_library_is_not_anyone_in_particulars_folder() {
+        let dir = Config::default().outline_dir;
+        let shown = dir.to_string_lossy();
+        assert!(shown.ends_with("Documents/Omaverse"), "got {shown}");
+        assert!(!shown.contains("Dropbox"), "no one else has that folder");
     }
 }

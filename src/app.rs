@@ -57,7 +57,7 @@ const CSS: &str = "
 ";
 
 pub struct App {
-    cfg: Config,
+    cfg: RefCell<Config>,
     /// Cache of the parsed buffer, refreshed on a debounce. The buffer, not
     /// this, is authoritative.
     doc: Rc<RefCell<Document>>,
@@ -293,7 +293,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         .build();
 
     // ---- window ------------------------------------------------------------
-    let wtitle = adw::WindowTitle::new("omaverse", "");
+    let wtitle = adw::WindowTitle::new("Omaverse", "");
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&wtitle));
     let sb_toggle = gtk::ToggleButton::builder()
@@ -310,6 +310,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     header.pack_end(&to_diagram);
 
     let doc_menu = gio::Menu::new();
+    doc_menu.append(Some("Library folder…"), Some("win.choose-library"));
     doc_menu.append(Some("Export as PDF…"), Some("win.export-pdf"));
     doc_menu.append(Some("Move to Trash…"), Some("win.trash-open"));
     let doc_btn = gtk::MenuButton::builder()
@@ -338,7 +339,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         .build();
 
     let app = Rc::new(App {
-        cfg,
+        cfg: RefCell::new(cfg),
         doc,
         path: RefCell::new(None),
         dstate: RefCell::new(DocState::default()),
@@ -677,6 +678,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     add_action(&window, "new-interlinear", {
         let a = app.clone();
         move || a.new_interlinear()
+    });
+    add_action(&window, "choose-library", {
+        let a = app.clone();
+        move || a.choose_library()
     });
     add_action(&window, "trash-open", {
         let a = app.clone();
@@ -2221,7 +2226,8 @@ impl App {
     }
 
     fn chooser_start_dir(&self) -> gio::File {
-        let dir = &self.cfg.outline_dir;
+        let dir = self.cfg.borrow().outline_dir.clone();
+        let dir = &dir;
         if !dir.exists() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -2728,6 +2734,26 @@ impl App {
         }
     }
 
+    /// Point the library somewhere else. Without this the only way to move it
+    /// is to find and edit a TOML file, which is no way to start.
+    fn choose_library(self: &Rc<Self>) {
+        let current = gio::File::for_path(&self.cfg.borrow().outline_dir);
+        let dialog = gtk::FileDialog::builder()
+            .title("Choose the folder your outlines live in")
+            .accept_label("Use this folder")
+            .initial_folder(&current)
+            .modal(true)
+            .build();
+        let me = self.clone();
+        dialog.select_folder(Some(&self.window), gio::Cancellable::NONE, move |res| {
+            if let Some(dir) = res.ok().and_then(|f| f.path()) {
+                me.cfg.borrow_mut().outline_dir = dir;
+                me.cfg.borrow().save();
+                me.refresh_library();
+            }
+        });
+    }
+
     // ---- getting rid of a document -----------------------------------------
 
     /// Ask first, and say plainly what is going. The file goes to the desktop
@@ -3172,12 +3198,15 @@ impl App {
             self.libbox.remove(&row);
         }
         let mut paths: Vec<Option<PathBuf>> = Vec::new();
-        let groups = library::scan(&self.cfg.outline_dir);
+        let groups = library::scan(&self.cfg.borrow().outline_dir);
 
         if groups.is_empty() {
             paths.push(None);
             self.libbox.append(&plain_row(
-                &format!("No outlines in\n{}", self.pretty(&self.cfg.outline_dir)),
+                &format!(
+                    "No outlines in\n{}\n\nPick another folder from the document menu.",
+                    self.pretty(&self.cfg.borrow().outline_dir)
+                ),
                 &["dim-label"],
                 true,
             ));
@@ -3196,7 +3225,7 @@ impl App {
             .recent
             .borrow()
             .iter()
-            .filter(|p| !p.starts_with(&self.cfg.outline_dir) && p.exists())
+            .filter(|p| !p.starts_with(&self.cfg.borrow().outline_dir) && p.exists())
             .cloned()
             .collect();
         if !outside.is_empty() {

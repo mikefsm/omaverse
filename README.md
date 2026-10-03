@@ -57,17 +57,29 @@ WAYLAND_DISPLAY=wayland-0 tools/vpointer/target/release/vpointer \
 
 ## Install
 
-Needs Rust, GTK 4.12+, and libadwaita 1.5+.
+### On Arch and omarchy
+
+```sh
+cd packaging && makepkg -si
+```
+
+`packaging/PKGBUILD` builds the tagged release and runs the test suite before
+installing. `packaging/PKGBUILD-git` tracks the latest commit instead. Both
+install the binary, desktop entry, icon and AppStream metadata system-wide.
+
+### From the source tree
+
+Needs Rust, GTK 4.12+, libadwaita 1.5+ and enchant.
 
 ```sh
 ./install.sh
 ```
 
 That builds, then puts the binary in `~/.local/bin`, a desktop entry in
-`~/.local/share/applications` and an icon in `~/.local/share/icons`, so omaverse
-appears in the omarchy launcher and opens `.md` files on double-click. The
-desktop entry is named for the application id so the window picks up its icon
-under Wayland.
+`~/.local/share/applications`, an icon in `~/.local/share/icons` and metadata in
+`~/.local/share/metainfo`, so Omaverse appears in the omarchy launcher and opens
+`.md` files on double-click. The desktop entry is named for the application id so
+the window picks up its icon under Wayland.
 
 To run without installing:
 
@@ -75,6 +87,24 @@ To run without installing:
 cargo build --release
 ./target/release/omaverse path/to/romans.md
 ```
+
+### Where your documents live
+
+On first run Omaverse creates `~/Documents/Omaverse` and scans it, recursively,
+with each subfolder becoming a group in the sidebar. To keep them somewhere else
+— a Dropbox folder, say — use **Library folder…** in the document menu, or edit
+`~/.config/omaverse/config.toml`.
+
+### Fonts
+
+Greek and Hebrew are set in SBL BibLit, falling back to SBL Greek and SBL Hebrew.
+These are published by the Society of Biblical Literature and are not packaged
+for Arch, so install them yourself into `~/.local/share/fonts`. Without them
+Omaverse falls back to the system serif, which will render pointed Hebrew and
+polytonic Greek less well but will not fail.
+
+Spell checking needs a dictionary: `pacman -S hunspell-en_us`. Without one,
+nothing is marked and nothing breaks.
 
 ## Status
 
@@ -213,3 +243,7 @@ Structural editing lives in `src/edit.rs` as pure functions of
 (document, selection) → (document, new selection), and line classification for
 rendering lives in `src/docview.rs`, also pure. Both are tested without a
 display; the widget handlers only translate a keystroke into a command.
+
+## Licence
+
+MIT. See `LICENSE`.

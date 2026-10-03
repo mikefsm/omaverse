@@ -2,7 +2,9 @@
 name = "omaverse"
 version = "0.1.0"
 edition = "2021"
-description = "A scripture outlining app: collapsible outline tree, Markdown on disk."
+license = "MIT"
+repository = "https://github.com/mikefsm/omaverse"
+description = "Outline scripture, annotate the original languages, and diagram sentences — in plain files"
 
 [dependencies]
 gtk4 = { version = "0.11", features = ["v4_12"] }

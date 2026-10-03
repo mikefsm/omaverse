@@ -43,7 +43,43 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Answered before GTK starts, so they work without a display and without
+/// handing off to a running instance. Packagers expect both.
+fn answered_on_the_command_line() -> bool {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("omaverse {}", env!("CARGO_PKG_VERSION"));
+                return true;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "omaverse {}\n\
+                     {}\n\n\
+                     Usage: omaverse [FILE]\n\n\
+                     FILE is an outline (.md), or an interlinear or diagram (.toml).\n\
+                     With omaverse already running, the file opens in that window.\n\n\
+                     Options:\n  \
+                     -h, --help       this text\n  \
+                     -V, --version    the version\n\n\
+                     The library folder is set in {} and from the app's\n\
+                     document menu.",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("CARGO_PKG_DESCRIPTION"),
+                    config::config_path().display(),
+                );
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn main() -> glib::ExitCode {
+    if answered_on_the_command_line() {
+        return glib::ExitCode::SUCCESS;
+    }
     let app = adw::Application::builder()
         .application_id(APP_ID)
         // HANDLES_OPEN so that `omaverse some.md` while omaverse is already

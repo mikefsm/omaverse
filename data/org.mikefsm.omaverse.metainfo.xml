@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.mikefsm.omaverse</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Omaverse</name>
+  <summary>Outline scripture, annotate the original languages, and diagram sentences</summary>
+
+  <description>
+    <p>
+      Omaverse is a study desk for working through a book of scripture. It keeps
+      three kinds of document, each in a plain file you can read without it.
+    </p>
+    <ul>
+      <li>
+        Outlines: ordinary Markdown, where the heading depth carries the
+        structure. The outline pane on the left is navigation; the text on the
+        right is one continuous document, foldable section by section.
+      </li>
+      <li>
+        Interlinears: a passage in Hebrew or Greek, one word at a time, with
+        your own gloss, lemma, parsing and notes written underneath each word.
+      </li>
+      <li>
+        Diagrams: a Reed-Kellogg canvas. The passage's words wait in a bank
+        along the bottom; drag them onto the standard strokes, which hold
+        together where they meet and move as one.
+      </li>
+    </ul>
+    <p>
+      Everything is Markdown or TOML on disk, written atomically, and never
+      overwritten if something else changed the file first. Any of the three can
+      be printed to PDF.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">org.mikefsm.omaverse.desktop</launchable>
+
+  <categories>
+    <category>Office</category>
+    <category>WordProcessor</category>
+  </categories>
+
+  <keywords>
+    <keyword>outline</keyword>
+    <keyword>scripture</keyword>
+    <keyword>bible</keyword>
+    <keyword>greek</keyword>
+    <keyword>hebrew</keyword>
+    <keyword>interlinear</keyword>
+    <keyword>sermon</keyword>
+    <keyword>markdown</keyword>
+  </keywords>
+
+  <provides>
+    <binary>omaverse</binary>
+  </provides>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-10-03">
+      <description>
+        <p>First release: outlines, interlinears, sentence diagrams, and PDF export.</p>
+      </description>
+    </release>
+  </releases>
+
+  <url type="homepage">https://github.com/mikefsm/omaverse</url>
+  <url type="bugtracker">https://github.com/mikefsm/omaverse/issues</url>
+
+  <developer id="org.mikefsm">
+    <name>Mike Smith</name>
+  </developer>
+</component>
