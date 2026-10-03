@@ -555,6 +555,21 @@ impl Diagram {
         }
     }
 
+    /// Let a stroke go, leaving it exactly where it is. What it holds stays
+    /// held by it: only its own tie to a host is cut.
+    pub fn free_line(&mut self, id: &str) -> bool {
+        match self.line_mut(id) {
+            Some(line) => line.joint.take().is_some(),
+            None => false,
+        }
+    }
+
+    /// Is this held by anything? Asked to decide whether letting go is offered.
+    pub fn is_held(&self, id: &str) -> bool {
+        self.line(id).is_some_and(|l| l.joint.is_some())
+            || self.label(id).is_some_and(|l| l.rest.is_some())
+    }
+
     /// Let a word go, leaving it where it was drawn.
     pub fn free_label(&mut self, id: &str) {
         let Some(label) = self.label(id) else { return };
@@ -1027,6 +1042,52 @@ mod tests {
         assert!((s - 1.0).abs() < 1e-9);
         assert!(t.abs() < 1e-9);
         assert!((d - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn letting_a_stroke_go_leaves_it_where_it_is_and_keeps_what_it_holds() {
+        let (mut d, base, _divider, slant) = clause();
+        let hanging = {
+            let head = point_at(d.line(&slant).unwrap(), 1.0);
+            let id = d.add_line(Preset::Slant, head.0, head.1);
+            d.settle_line(&id, 10.0);
+            id
+        };
+        let before = d.line(&slant).unwrap().clone();
+
+        assert!(d.is_held(&slant));
+        assert!(d.free_line(&slant));
+        assert!(!d.is_held(&slant));
+        assert_eq!(d.line(&slant).unwrap().x1, before.x1, "it did not budge");
+        assert_eq!(d.line(&slant).unwrap().y1, before.y1);
+        assert_eq!(
+            d.line(&hanging).unwrap().joint.as_ref().unwrap().host,
+            slant,
+            "what it holds is still holding on"
+        );
+
+        // Letting go twice is not an error, it is simply nothing.
+        assert!(!d.free_line(&slant));
+        assert!(d.is_held(&base) == false);
+    }
+
+    #[test]
+    fn letting_a_word_go_leaves_it_where_it_was_written() {
+        let (mut d, base, _divider, _slant) = clause();
+        let label = d.add_free_label("alpha", 0.0, 0.0);
+        d.set_rest(&label, &base, 0.3);
+        let (x, y, _) = d.anchor_of(d.label(&label).unwrap());
+
+        assert!(d.is_held(&label));
+        d.free_label(&label);
+        assert!(!d.is_held(&label));
+        let (fx, fy, angle) = d.anchor_of(d.label(&label).unwrap());
+        assert_eq!((fx, fy), (x, y), "exactly where it was");
+        assert_eq!(angle, 0.0);
+
+        // And it no longer travels with the stroke it used to sit on.
+        d.shift_line(&base, 0.0, 50.0);
+        assert_eq!(d.anchor_of(d.label(&label).unwrap()).1, y);
     }
 
     #[test]

@@ -55,6 +55,8 @@ pub struct Canvas {
     rtl: Rc<Cell<bool>>,
     /// Shown only when the diagram remembers the sheet it came from.
     to_source: gtk::Button,
+    /// Live only while something held is selected, so it says what is attached.
+    detach: gtk::Button,
 }
 
 impl Canvas {
@@ -118,6 +120,14 @@ impl Canvas {
         let add_label = gtk::Button::with_label("Label");
         add_label.set_tooltip_text(Some("Write a label of your own"));
         palette.append(&add_label);
+        let detach = gtk::Button::with_label("Detach");
+        detach.set_tooltip_text(Some(
+            "Let go of what is selected, leaving it where it is (Ctrl+D). \
+             Hold Ctrl while dragging to stop something attaching in the first place.",
+        ));
+        detach.set_sensitive(false);
+        palette.append(&detach);
+
         let delete = gtk::Button::from_icon_name("user-trash-symbolic");
         delete.set_tooltip_text(Some("Remove what is selected (Delete)"));
         palette.append(&delete);
@@ -183,6 +193,7 @@ impl Canvas {
             on_change: on_change.clone(),
             rtl: rtl.clone(),
             to_source: to_source.clone(),
+            detach: detach.clone(),
         };
 
         canvas.wire_drawing();
@@ -190,6 +201,10 @@ impl Canvas {
         canvas.wire_keys();
         canvas.wire_drop();
 
+        {
+            let c = canvas.handle();
+            detach.connect_clicked(move |_| c.detach_selected());
+        }
         {
             let c = canvas.handle();
             delete.connect_clicked(move |_| c.delete_selected());
@@ -214,6 +229,7 @@ impl Canvas {
             drag: self.drag.clone(),
             on_change: self.on_change.clone(),
             rtl: self.rtl.clone(),
+            detach: self.detach.clone(),
         }
     }
 
@@ -371,6 +387,7 @@ impl Canvas {
                 Drag::MoveLine { id, .. } | Drag::MoveEnd { id, .. } => Some(Sel::Line(id.clone())),
                 Drag::None => None,
             };
+            c.sync_detach();
             c.area.queue_draw();
         });
 
@@ -442,12 +459,29 @@ impl Canvas {
         });
 
         let c = self.handle();
-        gesture.connect_drag_end(move |_, _, _| {
+        gesture.connect_drag_end(move |g, _, _| {
             let job = c.drag.borrow().clone();
             *c.drag.borrow_mut() = Drag::None;
+            // Holding Ctrl puts something down without it taking hold, for
+            // when the stroke you want is next to the one that would catch it.
+            let loose = g
+                .current_event_state()
+                .contains(gdk::ModifierType::CONTROL_MASK);
             {
                 let mut held = c.doc.borrow_mut();
                 let Some(d) = held.as_mut() else { return };
+                if loose {
+                    match &job {
+                        Drag::MoveLine { id, .. } | Drag::MoveEnd { id, .. } => {
+                            d.free_line(id);
+                        }
+                        Drag::MoveLabel { id, .. } => d.free_label(id),
+                        Drag::None => return,
+                    }
+                    drop(held);
+                    c.changed();
+                    return;
+                }
                 // Wherever it came to rest, see what it came to rest against.
                 match &job {
                     Drag::MoveLine { id, .. } | Drag::MoveEnd { id, .. } => {
@@ -469,12 +503,17 @@ impl Canvas {
     fn wire_keys(&self) {
         let c = self.handle();
         let keys = gtk::EventControllerKey::new();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gdk::Key::Delete || key == gdk::Key::BackSpace {
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+            if ctrl && (key == gdk::Key::d || key == gdk::Key::D) {
+                c.detach_selected();
+                glib::Propagation::Stop
+            } else if key == gdk::Key::Delete || key == gdk::Key::BackSpace {
                 c.delete_selected();
                 glib::Propagation::Stop
             } else if key == gdk::Key::Escape {
                 *c.sel.borrow_mut() = None;
+                c.sync_detach();
                 c.area.queue_draw();
                 glib::Propagation::Stop
             } else {
@@ -526,10 +565,12 @@ struct Handle {
     drag: Rc<RefCell<Drag>>,
     on_change: Rc<RefCell<Option<Box<dyn Fn()>>>>,
     rtl: Rc<Cell<bool>>,
+    detach: gtk::Button,
 }
 
 impl Handle {
     fn changed(&self) {
+        self.sync_detach();
         self.area.queue_draw();
         if let Some(f) = self.on_change.borrow().as_ref() {
             f();
@@ -551,6 +592,41 @@ impl Handle {
             return Drag::MoveEnd { id: line.id.clone(), end };
         }
         Drag::MoveLine { id: line.id.clone(), dx: 0.0, dy: 0.0 }
+    }
+
+    /// Let go of whatever is selected without moving it. Dragging something
+    /// clear of its host does this too, but not when another stroke is right
+    /// there to catch it — which is exactly when a mistake gets made.
+    fn detach_selected(&self) {
+        let Some(sel) = self.sel.borrow().clone() else { return };
+        let freed = {
+            let mut held = self.doc.borrow_mut();
+            let Some(d) = held.as_mut() else { return };
+            match &sel {
+                Sel::Line(id) => d.free_line(id),
+                Sel::Label(id) => {
+                    let was = d.is_held(id);
+                    d.free_label(id);
+                    was
+                }
+            }
+        };
+        if freed {
+            self.changed();
+        }
+    }
+
+    /// The Detach button is live only when there is something to let go of.
+    fn sync_detach(&self) {
+        let live = match self.sel.borrow().as_ref() {
+            None => false,
+            Some(Sel::Line(id)) | Some(Sel::Label(id)) => self
+                .doc
+                .borrow()
+                .as_ref()
+                .is_some_and(|d| d.is_held(id)),
+        };
+        self.detach.set_sensitive(live);
     }
 
     fn delete_selected(&self) {
