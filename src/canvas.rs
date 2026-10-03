@@ -15,6 +15,8 @@ use std::rc::Rc;
 
 /// How close the pointer has to be to take hold of something.
 const GRAB: f64 = 9.0;
+/// How close a stroke or word has to come to rest for it to be held there.
+const SNAP: f64 = 16.0;
 /// The canvas is fixed and generous rather than growing to fit; a diagram that
 /// needs more room than this is really two diagrams.
 const WIDTH: i32 = 2200;
@@ -30,8 +32,10 @@ pub enum Sel {
 #[derive(Debug, Clone)]
 enum Drag {
     None,
-    MoveLabel { id: String, x: f64, y: f64 },
-    MoveLine { id: String, x1: f64, y1: f64, x2: f64, y2: f64 },
+    /// Moves are applied as the change since the last report, so whatever is
+    /// held by what is moving comes along with it.
+    MoveLabel { id: String, dx: f64, dy: f64 },
+    MoveLine { id: String, dx: f64, dy: f64 },
     MoveEnd { id: String, end: End },
 }
 
@@ -289,35 +293,52 @@ impl Canvas {
             }
 
             cr.set_dash(&[], 0.0);
+
+            // The dots that say what is held to what.
+            cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.9);
+            for (jx, jy) in d.joints() {
+                cr.arc(jx, jy, 3.0, 0.0, std::f64::consts::TAU);
+                let _ = cr.fill();
+            }
+
             let mut measured = Vec::new();
             for label in &d.labels {
                 let layout = area.create_pango_layout(Some(&label.text));
                 layout.set_font_description(Some(&pango::FontDescription::from_string(
                     "SBL BibLit, SBL Greek, SBL Hebrew 15",
                 )));
-                let (ink, _logical) = layout.pixel_extents();
                 let baseline = layout.baseline() as f64 / pango::SCALE as f64;
                 let (w, h) = layout.pixel_size();
-                // The text rests on the point, as it rests on a line.
-                let top = label.y - baseline - 2.0;
-                let left = label.x;
+                let (ax, ay, angle) = d.anchor_of(label);
+                // The word is centred on its point and rests on it, as a word
+                // rests on a line.
+                let (ox, oy) = (-(w as f64) / 2.0, -baseline - 2.0);
 
+                let _ = cr.save();
+                cr.translate(ax, ay);
+                if angle != 0.0 {
+                    cr.rotate(angle);
+                }
                 if sel.as_ref() == Some(&Sel::Label(label.id.clone())) {
-                    cr.set_source_rgba(
-                        fg.red() as f64,
-                        fg.green() as f64,
-                        fg.blue() as f64,
-                        0.14,
-                    );
-                    cr.rectangle(left - 3.0, top - 1.0, w as f64 + 6.0, h as f64 + 2.0);
+                    cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 0.14);
+                    cr.rectangle(ox - 3.0, oy - 1.0, w as f64 + 6.0, h as f64 + 2.0);
                     let _ = cr.fill();
                 }
-
                 cr.set_source_rgba(fg.red() as f64, fg.green() as f64, fg.blue() as f64, 1.0);
-                cr.move_to(left, top);
+                cr.move_to(ox, oy);
                 pangocairo::functions::show_layout(cr, &layout);
-                let _ = ink;
-                measured.push((label.id.clone(), left - 3.0, top - 1.0, w as f64 + 6.0, h as f64 + 2.0));
+                let _ = cr.restore();
+
+                // Hit testing is on the upright box around where it was drawn:
+                // close enough for a word, and far simpler than a rotated one.
+                let reach = (w as f64 / 2.0) * angle.cos().abs() + (h as f64) * angle.sin().abs();
+                measured.push((
+                    label.id.clone(),
+                    ax - reach - 3.0,
+                    ay + oy - 1.0,
+                    reach * 2.0 + 6.0,
+                    h as f64 + 2.0,
+                ));
             }
             *rects.borrow_mut() = measured;
         });
@@ -339,16 +360,7 @@ impl Canvas {
                     d.add_line(preset, x, y)
                 };
                 // Carry on dragging it into place in the same gesture.
-                let line = c.doc.borrow().as_ref().and_then(|d| d.line(&id).cloned());
-                if let Some(l) = line {
-                    *c.drag.borrow_mut() = Drag::MoveLine {
-                        id: id.clone(),
-                        x1: l.x1,
-                        y1: l.y1,
-                        x2: l.x2,
-                        y2: l.y2,
-                    };
-                }
+                *c.drag.borrow_mut() = Drag::MoveLine { id: id.clone(), dx: 0.0, dy: 0.0 };
                 *c.sel.borrow_mut() = Some(Sel::Line(id));
                 c.changed();
                 return;
@@ -371,19 +383,44 @@ impl Canvas {
                 let Some(d) = held.as_mut() else { return };
                 match job {
                     Drag::None => return,
-                    Drag::MoveLabel { id, x, y } => {
-                        if let Some(l) = d.label_mut(&id) {
-                            l.x = x + dx;
-                            l.y = y + dy;
+                    Drag::MoveLabel { id, dx: px, dy: py } => {
+                        // A word on a stroke slides along it, so a small drag
+                        // adjusts its place rather than tearing it off. Pull
+                        // further than that and it comes away.
+                        let (step_x, step_y) = (dx - px, dy - py);
+                        let Some((ax, ay, _)) = d.label(&id).map(|l| d.anchor_of(l)) else {
+                            return;
+                        };
+                        let (wx, wy) = (ax + step_x, ay + step_y);
+                        let resting = d.label(&id).and_then(|l| l.rest.clone());
+                        match resting {
+                            Some(rest) => match d.line(&rest.host) {
+                                Some(host) => {
+                                    let (t, away) = crate::diagram::nearest_param(host, wx, wy);
+                                    if away > SNAP * 2.0 {
+                                        d.free_label(&id);
+                                        if let Some(l) = d.label_mut(&id) {
+                                            l.x = wx;
+                                            l.y = wy;
+                                        }
+                                    } else {
+                                        d.set_rest(&id, &rest.host, t);
+                                    }
+                                }
+                                None => d.free_label(&id),
+                            },
+                            None => {
+                                if let Some(l) = d.label_mut(&id) {
+                                    l.x = wx;
+                                    l.y = wy;
+                                }
+                            }
                         }
+                        *c.drag.borrow_mut() = Drag::MoveLabel { id, dx, dy };
                     }
-                    Drag::MoveLine { id, x1, y1, x2, y2 } => {
-                        if let Some(l) = d.line_mut(&id) {
-                            l.x1 = x1 + dx;
-                            l.y1 = y1 + dy;
-                            l.x2 = x2 + dx;
-                            l.y2 = y2 + dy;
-                        }
+                    Drag::MoveLine { id, dx: px, dy: py } => {
+                        d.shift_line(&id, dx - px, dy - py);
+                        *c.drag.borrow_mut() = Drag::MoveLine { id, dx, dy };
                     }
                     Drag::MoveEnd { id, end } => {
                         if let Some(l) = d.line_mut(&id) {
@@ -406,11 +443,25 @@ impl Canvas {
 
         let c = self.handle();
         gesture.connect_drag_end(move |_, _, _| {
-            let moved = !matches!(&*c.drag.borrow(), Drag::None);
+            let job = c.drag.borrow().clone();
             *c.drag.borrow_mut() = Drag::None;
-            if moved {
-                c.changed();
+            {
+                let mut held = c.doc.borrow_mut();
+                let Some(d) = held.as_mut() else { return };
+                // Wherever it came to rest, see what it came to rest against.
+                match &job {
+                    Drag::MoveLine { id, .. } | Drag::MoveEnd { id, .. } => {
+                        d.settle_line(id, SNAP);
+                    }
+                    Drag::MoveLabel { id, .. } => {
+                        if d.label(id).is_some_and(|l| l.rest.is_none()) {
+                            d.settle_label(id, SNAP);
+                        }
+                    }
+                    Drag::None => return,
+                }
             }
+            c.changed();
         });
         self.area.add_controller(gesture);
     }
@@ -443,7 +494,11 @@ impl Canvas {
             let placed = {
                 let mut held = c.doc.borrow_mut();
                 let Some(d) = held.as_mut() else { return false };
-                d.place(&word_id, x, y)
+                let placed = d.place(&word_id, x, y);
+                if let Some(id) = &placed {
+                    d.settle_label(id, SNAP);
+                }
+                placed
             };
             match placed {
                 Some(id) => {
@@ -486,9 +541,7 @@ impl Handle {
     fn pick(&self, x: f64, y: f64) -> Drag {
         for (id, rx, ry, rw, rh) in self.rects.borrow().iter().rev() {
             if x >= *rx && x <= rx + rw && y >= *ry && y <= ry + rh {
-                if let Some(l) = self.doc.borrow().as_ref().and_then(|d| d.label(id)) {
-                    return Drag::MoveLabel { id: id.clone(), x: l.x, y: l.y };
-                }
+                return Drag::MoveLabel { id: id.clone(), dx: 0.0, dy: 0.0 };
             }
         }
         let held = self.doc.borrow();
@@ -497,13 +550,7 @@ impl Handle {
         if let Some(end) = d.end_at(line, x, y, GRAB) {
             return Drag::MoveEnd { id: line.id.clone(), end };
         }
-        Drag::MoveLine {
-            id: line.id.clone(),
-            x1: line.x1,
-            y1: line.y1,
-            x2: line.x2,
-            y2: line.y2,
-        }
+        Drag::MoveLine { id: line.id.clone(), dx: 0.0, dy: 0.0 }
     }
 
     fn delete_selected(&self) {
