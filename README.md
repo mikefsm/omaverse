@@ -60,12 +60,22 @@ WAYLAND_DISPLAY=wayland-0 tools/vpointer/target/release/vpointer \
 ### On Arch and omarchy
 
 ```sh
-cd packaging && makepkg -si
+git clone https://github.com/mikefsm/omaverse.git
+cd omaverse/packaging && makepkg -si
 ```
 
-`packaging/PKGBUILD` builds the tagged release and runs the test suite before
-installing. `packaging/PKGBUILD-git` tracks the latest commit instead. Both
-install the binary, desktop entry, icon and AppStream metadata system-wide.
+That is a real package: `pacman` owns the files, `pacman -R omaverse` removes
+them cleanly, and the test suite has to pass before it will install.
+`PKGBUILD` builds the latest tagged release; `PKGBUILD-git` beside it tracks the
+latest commit instead — rename it to `PKGBUILD` in a directory of its own.
+
+Both install the binary, the desktop entry, the icon and the AppStream metadata
+system-wide, so Omaverse appears in the launcher and opens `.md` files on
+double-click.
+
+Omaverse is not on the AUR yet: registration for new AUR accounts is paused
+while the Arch team deal with automated sign-ups. The command above needs no AUR
+account and installs exactly what the AUR package would.
 
 ### From the source tree
 
