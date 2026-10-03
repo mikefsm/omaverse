@@ -283,7 +283,7 @@ pub fn install_tags(buffer: &gtk::TextBuffer) {
     let scales = [1.45_f64, 1.22, 1.10, 1.02, 1.0, 1.0];
     for d in 0..=MAX_DEPTH {
         let tag = gtk::TextTag::builder()
-            .name(&format!("h{d}"))
+            .name(format!("h{d}"))
             .scale(scales[d.min(scales.len() - 1)])
             .weight(if d <= 2 { 700 } else { 600 })
             .pixels_above_lines(if d == 0 { 22 } else { 16 })
@@ -293,7 +293,7 @@ pub fn install_tags(buffer: &gtk::TextBuffer) {
         table.add(&tag);
 
         let body = gtk::TextTag::builder()
-            .name(&format!("b{d}"))
+            .name(format!("b{d}"))
             .left_margin(indent_px(d) + 18)
             .pixels_below_lines(3)
             .build();

@@ -217,9 +217,7 @@ fn serialize_notes(notes: &[Note]) -> String {
 pub fn parse(src: &str) -> Document {
     let (body_src, notes) = split_notes(src);
     let (title, rest) = split_front(&body_src);
-    let mut doc = Document::default();
-    doc.notes = notes;
-    doc.title = title;
+    let mut doc = Document { notes, title, ..Default::default() };
 
     let lines: Vec<&str> = rest.lines().collect();
     let mut i = 0;

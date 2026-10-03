@@ -249,8 +249,11 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     new_from_empty.set_halign(gtk::Align::Center);
     let empty = adw::StatusPage::builder()
         .icon_name("view-list-symbolic")
-        .title("No outline open")
-        .description("Create one, pick a book from the sidebar, or pass a file on the command line.")
+        .title("Nothing open")
+        .description(
+            "Pick a document from the library, or start an outline. Interlinears \
+             and diagrams are made from the + menu and from a sheet.",
+        )
         .child(&new_from_empty)
         .build();
 
@@ -285,9 +288,9 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     find_btn.set_tooltip_text(Some("Search every document (Ctrl+F)"));
 
     let open_btn = gtk::Button::from_icon_name("document-open-symbolic");
-    open_btn.set_tooltip_text(Some("Open an outline (Ctrl+O)"));
+    open_btn.set_tooltip_text(Some("Open a document (Ctrl+O)"));
     let sb_header = adw::HeaderBar::new();
-    sb_header.set_title_widget(Some(&adw::WindowTitle::new("Outlines", "")));
+    sb_header.set_title_widget(Some(&adw::WindowTitle::new("Library", "")));
     sb_header.set_show_end_title_buttons(false);
     sb_header.pack_end(&new_btn);
     sb_header.pack_start(&open_btn);
@@ -2326,17 +2329,27 @@ impl App {
         }
     }
 
+    /// Everything Omaverse can open, then each kind on its own.
     fn md_filters() -> (gio::ListStore, gtk::FileFilter) {
+        let any = gtk::FileFilter::new();
+        any.set_name(Some("Omaverse documents"));
+        any.add_suffix("md");
+        any.add_suffix("toml");
         let md = gtk::FileFilter::new();
-        md.set_name(Some("Markdown"));
+        md.set_name(Some("Outlines"));
         md.add_suffix("md");
+        let toml = gtk::FileFilter::new();
+        toml.set_name(Some("Interlinears and diagrams"));
+        toml.add_suffix("toml");
         let all = gtk::FileFilter::new();
         all.set_name(Some("All files"));
         all.add_pattern("*");
         let store = gio::ListStore::new::<gtk::FileFilter>();
+        store.append(&any);
         store.append(&md);
+        store.append(&toml);
         store.append(&all);
-        (store, md)
+        (store, any)
     }
 
     fn chooser_start_dir(&self) -> gio::File {
@@ -2520,7 +2533,7 @@ impl App {
     fn open_dialog(self: &Rc<Self>) {
         let (filters, default) = Self::md_filters();
         let dialog = gtk::FileDialog::builder()
-            .title("Open outline")
+            .title("Open a document")
             .initial_folder(&self.chooser_start_dir())
             .filters(&filters)
             .default_filter(&default)
@@ -2555,8 +2568,7 @@ impl App {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "Untitled".to_string());
-        let mut d = Document::default();
-        d.title = Some(name);
+        let d = Document { title: Some(name), ..Default::default() };
         if let Err(e) = crate::atomic_write(&path, parse::serialize(&d).as_bytes()) {
             eprintln!("omaverse: could not create {}: {e}", path.display());
             self.wtitle.set_subtitle(&format!("Could not create outline — {e}"));
@@ -3369,18 +3381,21 @@ impl App {
     fn section_reference_text(&self) -> Option<String> {
         let text = self.full_text();
         let heading = self.section_heading_line()?;
-        let kinds = docview::classify(&text);
-        let lines: Vec<&str> = text.lines().collect();
-        // The reference belongs to this section, so stop at the next heading.
-        for i in heading + 1..lines.len() {
-            if matches!(kinds.get(i), Some(docview::Line::Heading { .. })) {
-                break;
-            }
-            if let Some(r) = docview::ref_marker(lines[i]) {
-                return Some(r.to_string());
-            }
-        }
-        None
+        let at = Self::section_ref_line(&text, heading)?;
+        docview::ref_marker(text.lines().nth(at)?).map(|r| r.to_string())
+    }
+
+    /// The line carrying a section's reference marker, if it has one. The
+    /// marker belongs to the section it sits in, so the search stops at the
+    /// next heading rather than running on into the one below.
+    fn section_ref_line(text: &str, heading: usize) -> Option<usize> {
+        let kinds = docview::classify(text);
+        text.lines()
+            .enumerate()
+            .skip(heading + 1)
+            .take_while(|(i, _)| !matches!(kinds.get(*i), Some(docview::Line::Heading { .. })))
+            .find(|(_, line)| docview::ref_marker(line).is_some())
+            .map(|(i, _)| i)
     }
 
     /// The passage the cursor is in, or that the open sheet or diagram is about.
@@ -3404,19 +3419,7 @@ impl App {
     fn set_section_reference(&self, text: &str) {
         let Some(heading) = self.section_heading_line() else { return };
         let full = self.full_text();
-        let kinds = docview::classify(&full);
-        let lines: Vec<&str> = full.lines().collect();
-
-        let mut existing = None;
-        for i in heading + 1..lines.len() {
-            if matches!(kinds.get(i), Some(docview::Line::Heading { .. })) {
-                break;
-            }
-            if docview::ref_marker(lines[i]).is_some() {
-                existing = Some(i);
-                break;
-            }
-        }
+        let existing = Self::section_ref_line(&full, heading);
 
         let text = text.trim();
         let buffer = &self.buffer;
@@ -3899,7 +3902,7 @@ impl App {
             paths.push(None);
             self.libbox.append(&plain_row(
                 &format!(
-                    "No outlines in\n{}\n\nPick another folder from the document menu.",
+                    "No documents in\n{}\n\nPick another folder from the document menu.",
                     self.pretty(&self.cfg.borrow().outline_dir)
                 ),
                 &["dim-label"],

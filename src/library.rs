@@ -118,12 +118,12 @@ pub fn scan(root: &Path) -> Vec<Group> {
     collect(root, root, 0, &mut ungrouped, &mut groups);
 
     for g in &mut groups {
-        g.entries.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        g.entries.sort_by_key(|a| a.title.to_lowercase());
     }
     groups.sort_by(|a, b| {
         a.name.as_deref().unwrap_or("").to_lowercase().cmp(&b.name.as_deref().unwrap_or("").to_lowercase())
     });
-    ungrouped.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    ungrouped.sort_by_key(|a| a.title.to_lowercase());
 
     let mut out = Vec::new();
     if !ungrouped.is_empty() {

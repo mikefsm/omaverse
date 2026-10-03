@@ -48,6 +48,12 @@ enum Drag {
     MoveEnd { id: String, end: End },
 }
 
+/// Where a label was drawn: its id and the box around it, in the diagram's own
+/// units. Text extents are only known once drawn, so they are remembered.
+type Measured = Rc<RefCell<Vec<(String, f64, f64, f64, f64)>>>;
+/// What to call when the diagram changes, so it can be saved.
+type OnChange = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
 /// Snapshots either side of the present.
 #[derive(Default)]
 struct History {
@@ -61,13 +67,13 @@ pub struct Canvas {
     bankbox: gtk::FlowBox,
     doc: Rc<RefCell<Option<Diagram>>>,
     /// Where each label was drawn last time, for picking one out from under the
-    /// pointer. Text extents are only known once drawn.
-    rects: Rc<RefCell<Vec<(String, f64, f64, f64, f64)>>>,
+    /// pointer.
+    rects: Measured,
     sel: Rc<RefCell<Option<Sel>>>,
     /// A palette stroke waiting for somewhere to go.
     armed: Rc<Cell<Option<Preset>>>,
     drag: Rc<RefCell<Drag>>,
-    on_change: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    on_change: OnChange,
     rtl: Rc<Cell<bool>>,
     history: Rc<RefCell<History>>,
     /// How much bigger than its own units the canvas is drawn.
@@ -87,7 +93,7 @@ impl Canvas {
         let sel: Rc<RefCell<Option<Sel>>> = Rc::new(RefCell::new(None));
         let armed: Rc<Cell<Option<Preset>>> = Rc::new(Cell::new(None));
         let drag = Rc::new(RefCell::new(Drag::None));
-        let on_change: Rc<RefCell<Option<Box<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let on_change: OnChange = Rc::new(RefCell::new(None));
         let rtl = Rc::new(Cell::new(false));
         let history: Rc<RefCell<History>> = Rc::new(RefCell::new(History::default()));
         let zoom = Rc::new(Cell::new(1.0));
@@ -704,11 +710,11 @@ struct Handle {
     area: gtk::DrawingArea,
     bankbox: gtk::FlowBox,
     doc: Rc<RefCell<Option<Diagram>>>,
-    rects: Rc<RefCell<Vec<(String, f64, f64, f64, f64)>>>,
+    rects: Measured,
     sel: Rc<RefCell<Option<Sel>>>,
     armed: Rc<Cell<Option<Preset>>>,
     drag: Rc<RefCell<Drag>>,
-    on_change: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    on_change: OnChange,
     rtl: Rc<Cell<bool>>,
     history: Rc<RefCell<History>>,
     zoom: Rc<Cell<f64>>,

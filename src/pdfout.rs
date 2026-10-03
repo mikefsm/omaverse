@@ -98,7 +98,7 @@ impl Sheet {
 type Done = Result<usize, cairo::Error>;
 
 fn surface(path: &Path, sheet: Sheet) -> Result<PdfSurface, cairo::Error> {
-    PdfSurface::new(sheet.width, sheet.height, path).map_err(cairo::Error::from)
+    PdfSurface::new(sheet.width, sheet.height, path)
 }
 
 fn layout(cr: &Context, text: &str, font: &str, size: f64, width: Option<f64>) -> pango::Layout {

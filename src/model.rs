@@ -188,10 +188,8 @@ impl Document {
         let (vec, idx) = self.container_mut(path)?;
         let node = vec.remove(idx);
         let parent_path = &path[..path.len() - 1];
-        let (gvec, pidx) = match self.container_mut(parent_path) {
-            Some(v) => v,
-            None => return None, // unreachable: depth >= 2 guarantees a parent
-        };
+        // Unreachable in practice: a depth of two or more guarantees a parent.
+        let (gvec, pidx) = self.container_mut(parent_path)?;
         gvec.insert(pidx + 1, node);
         let mut p = parent_path.to_vec();
         *p.last_mut()? = pidx + 1;

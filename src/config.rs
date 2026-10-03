@@ -52,7 +52,8 @@ impl Config {
         }
         let body = format!(
             "# omaverse configuration\n\
-             # Directory scanned for outlines. Subfolders become sidebar groups.\n\
+             # The library: scanned for outlines, interlinears and diagrams.\n\
+             # Subfolders become groups in the sidebar.\n\
              # Changeable from the app: the document menu, \"Library folder…\".\n\
              outline_dir = {}\n",
             toml::Value::from(self.outline_dir.to_string_lossy().to_string())

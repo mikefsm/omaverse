@@ -531,7 +531,7 @@ impl Diagram {
     ///
     /// Returns where the joint was made.
     pub fn settle_line(&mut self, id: &str, tol: f64) -> Option<(f64, f64)> {
-        let Some(line) = self.line(id).cloned() else { return None };
+        let line = self.line(id).cloned()?;
         let mut best: Option<(String, f64, f64, f64)> = None;
         for host in &self.lines {
             // Never hold a line to itself or to anything it already holds.
