@@ -338,6 +338,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     let doc_menu = gio::Menu::new();
     doc_menu.append(Some("Library folder…"), Some("win.choose-library"));
     doc_menu.append(Some("Export as PDF…"), Some("win.export-pdf"));
+    doc_menu.append(Some("Rename…"), Some("win.rename-open"));
     doc_menu.append(Some("Move to Trash…"), Some("win.trash-open"));
     let doc_btn = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
@@ -477,6 +478,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         // opening it first.
         let a = app.clone();
         let menu = gio::Menu::new();
+        menu.append(Some("Rename…"), Some("win.rename-listed"));
         menu.append(Some("Move to Trash…"), Some("win.trash-listed"));
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
         popover.set_parent(&libbox);
@@ -732,6 +734,14 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     add_action(&window, "choose-library", {
         let a = app.clone();
         move || a.choose_library()
+    });
+    add_action(&window, "rename-open", {
+        let a = app.clone();
+        move || a.rename_open_document()
+    });
+    add_action(&window, "rename-listed", {
+        let a = app.clone();
+        move || a.rename_from_sidebar()
     });
     add_action(&window, "trash-open", {
         let a = app.clone();
@@ -2927,6 +2937,130 @@ impl App {
                 me.refresh_library();
             }
         });
+    }
+
+    /// Give a document a different file name, keeping its extension and its
+    /// folder. Renaming is the other half of deleting: without it the only way
+    /// to correct a name is to make a new document and move the text by hand.
+    fn rename_document(self: &Rc<Self>, path: &Path) {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let dlg = adw::AlertDialog::new(Some("Rename"), None);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        column.set_margin_top(6);
+        let entry = gtk::Entry::builder().text(&stem).build();
+        entry.set_activates_default(true);
+        column.append(&entry);
+        let hint = gtk::Label::new(Some(&format!(
+            "In {}",
+            path.parent()
+                .map(|p| self.pretty(p))
+                .unwrap_or_else(|| ".".into())
+        )));
+        hint.add_css_class("dim-label");
+        hint.set_wrap(true);
+        hint.set_xalign(0.0);
+        hint.set_max_width_chars(40);
+        column.append(&hint);
+        dlg.set_extra_child(Some(&column));
+        dlg.add_response("cancel", "Cancel");
+        dlg.add_response("rename", "Rename");
+        dlg.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+        dlg.set_default_response(Some("rename"));
+        dlg.set_close_response("cancel");
+
+        let me = self.clone();
+        let path = path.to_path_buf();
+        {
+            let entry = entry.clone();
+            dlg.connect_response(None, move |_, answer| {
+                if answer == "rename" {
+                    me.do_rename(&path, &entry.text());
+                }
+            });
+        }
+        dlg.present(Some(&self.window));
+        // Focused once the dialog is up, so the name can be typed over at once.
+        glib::idle_add_local_once(move || {
+            entry.grab_focus();
+        });
+    }
+
+    fn do_rename(self: &Rc<Self>, from: &Path, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || name == from.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default()
+        {
+            return;
+        }
+        // A name, not a path: a rename should never quietly move a document
+        // somewhere else, or climb out of the library.
+        if name.contains(std::path::is_separator) || name.starts_with('.') {
+            self.wtitle
+                .set_subtitle("A name cannot contain a path separator or begin with a dot");
+            self.wtitle.add_css_class("oma-error");
+            return;
+        }
+        let Some(dir) = from.parent() else { return };
+        let to = match from.extension().and_then(|e| e.to_str()) {
+            Some(ext) => dir.join(format!("{name}.{ext}")),
+            None => dir.join(name),
+        };
+        if to.exists() {
+            self.wtitle
+                .set_subtitle(&format!("{} already exists", self.pretty(&to)));
+            self.wtitle.add_css_class("oma-error");
+            return;
+        }
+
+        let open = self.path.borrow().as_deref() == Some(from);
+        if open {
+            // Write it out under the old name first: the rename moves whatever
+            // is on disk, so anything unsaved would otherwise be lost.
+            self.save_doc();
+            self.dirty_doc.set(false);
+        }
+        if let Err(e) = std::fs::rename(from, &to) {
+            eprintln!("omaverse: could not rename {}: {e}", from.display());
+            self.wtitle.set_subtitle(&format!("Not renamed — {e}"));
+            self.wtitle.add_css_class("oma-error");
+            return;
+        }
+
+        state::forget_doc(from);
+        for p in self.recent.borrow_mut().iter_mut() {
+            if p == from {
+                *p = to.clone();
+            }
+        }
+        if open {
+            // The document has not changed, only where it lives. Point at the
+            // new name rather than reopening: opening flushes what is current
+            // first, and at that moment the old name would be written back out.
+            *self.path.borrow_mut() = Some(to.clone());
+            self.record_stamp(&to);
+            self.wtitle.set_subtitle(&self.pretty(&to));
+            self.wtitle.remove_css_class("oma-error");
+            state::push_recent(&mut self.recent.borrow_mut(), &to);
+        }
+        self.refresh_library();
+        self.save_window_state();
+        self.toasts
+            .add_toast(adw::Toast::new(&format!("Renamed to {name}")));
+    }
+
+    fn rename_from_sidebar(self: &Rc<Self>) {
+        let Some(path) = self.menu_target.borrow().clone() else { return };
+        self.rename_document(&path);
+    }
+
+    fn rename_open_document(self: &Rc<Self>) {
+        let Some(path) = self.path.borrow().clone() else {
+            self.wtitle.set_subtitle("Nothing open to rename");
+            return;
+        };
+        self.rename_document(&path);
     }
 
     // ---- getting rid of a document -----------------------------------------
