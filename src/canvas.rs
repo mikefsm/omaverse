@@ -17,6 +17,9 @@ use std::rc::Rc;
 const GRAB: f64 = 9.0;
 /// How close a stroke or word has to come to rest for it to be held there.
 const SNAP: f64 = 16.0;
+/// How far back undo reaches. A diagram is small enough that keeping whole
+/// copies is simpler, and cheaper, than working out how to reverse each change.
+const HISTORY: usize = 120;
 /// The canvas is fixed and generous rather than growing to fit; a diagram that
 /// needs more room than this is really two diagrams.
 const WIDTH: i32 = 2200;
@@ -39,6 +42,13 @@ enum Drag {
     MoveEnd { id: String, end: End },
 }
 
+/// Snapshots either side of the present.
+#[derive(Default)]
+struct History {
+    past: Vec<Diagram>,
+    future: Vec<Diagram>,
+}
+
 pub struct Canvas {
     pub root: gtk::Box,
     area: gtk::DrawingArea,
@@ -53,6 +63,7 @@ pub struct Canvas {
     drag: Rc<RefCell<Drag>>,
     on_change: Rc<RefCell<Option<Box<dyn Fn()>>>>,
     rtl: Rc<Cell<bool>>,
+    history: Rc<RefCell<History>>,
     /// Shown only when the diagram remembers the sheet it came from.
     to_source: gtk::Button,
     /// Live only while something held is selected, so it says what is attached.
@@ -68,6 +79,7 @@ impl Canvas {
         let drag = Rc::new(RefCell::new(Drag::None));
         let on_change: Rc<RefCell<Option<Box<dyn Fn()>>>> = Rc::new(RefCell::new(None));
         let rtl = Rc::new(Cell::new(false));
+        let history: Rc<RefCell<History>> = Rc::new(RefCell::new(History::default()));
 
         let area = gtk::DrawingArea::builder()
             .content_width(WIDTH)
@@ -192,6 +204,7 @@ impl Canvas {
             drag: drag.clone(),
             on_change: on_change.clone(),
             rtl: rtl.clone(),
+            history: history.clone(),
             to_source: to_source.clone(),
             detach: detach.clone(),
         };
@@ -229,6 +242,7 @@ impl Canvas {
             drag: self.drag.clone(),
             on_change: self.on_change.clone(),
             rtl: self.rtl.clone(),
+            history: self.history.clone(),
             detach: self.detach.clone(),
         }
     }
@@ -252,6 +266,7 @@ impl Canvas {
     pub fn show(&self, diagram: Diagram, rtl: bool) {
         self.rtl.set(rtl);
         *self.sel.borrow_mut() = None;
+        *self.history.borrow_mut() = History::default();
         self.to_source.set_visible(diagram.source.is_some());
         *self.doc.borrow_mut() = Some(diagram);
         self.handle().refill_bank();
@@ -262,9 +277,24 @@ impl Canvas {
         self.doc.borrow().clone()
     }
 
+    /// Is a diagram the thing on screen? Asked before sending undo here rather
+    /// than to the text view.
+    pub fn is_open(&self) -> bool {
+        self.doc.borrow().is_some()
+    }
+
+    pub fn undo(&self) {
+        self.handle().step(true);
+    }
+
+    pub fn redo(&self) {
+        self.handle().step(false);
+    }
+
     pub fn clear(&self) {
         *self.doc.borrow_mut() = None;
         *self.sel.borrow_mut() = None;
+        *self.history.borrow_mut() = History::default();
         self.handle().refill_bank();
         self.area.queue_draw();
     }
@@ -370,6 +400,7 @@ impl Canvas {
                 for b in &palette {
                     b.set_active(false);
                 }
+                c.checkpoint();
                 let id = {
                     let mut held = c.doc.borrow_mut();
                     let Some(d) = held.as_mut() else { return };
@@ -381,7 +412,11 @@ impl Canvas {
                 c.changed();
                 return;
             }
-            *c.drag.borrow_mut() = c.pick(x, y);
+            let job = c.pick(x, y);
+            if !matches!(job, Drag::None) {
+                c.checkpoint();
+            }
+            *c.drag.borrow_mut() = job;
             *c.sel.borrow_mut() = match &*c.drag.borrow() {
                 Drag::MoveLabel { id, .. } => Some(Sel::Label(id.clone())),
                 Drag::MoveLine { id, .. } | Drag::MoveEnd { id, .. } => Some(Sel::Line(id.clone())),
@@ -530,6 +565,7 @@ impl Canvas {
             let Ok(word_id) = value.get::<String>() else {
                 return false;
             };
+            c.checkpoint();
             let placed = {
                 let mut held = c.doc.borrow_mut();
                 let Some(d) = held.as_mut() else { return false };
@@ -565,10 +601,42 @@ struct Handle {
     drag: Rc<RefCell<Drag>>,
     on_change: Rc<RefCell<Option<Box<dyn Fn()>>>>,
     rtl: Rc<Cell<bool>>,
+    history: Rc<RefCell<History>>,
     detach: gtk::Button,
 }
 
 impl Handle {
+    /// Remember the diagram as it stands, before changing it. Everything a
+    /// user action does — a drag with its settling, a delete, a detach — is one
+    /// checkpoint, so one undo takes back one action rather than part of one.
+    fn checkpoint(&self) {
+        let Some(now) = self.doc.borrow().clone() else { return };
+        let mut history = self.history.borrow_mut();
+        history.past.push(now);
+        if history.past.len() > HISTORY {
+            history.past.remove(0);
+        }
+        // A new change is a new branch: what was undone cannot be redone.
+        history.future.clear();
+    }
+
+    /// Move one step back or forward through the snapshots.
+    fn step(&self, back: bool) {
+        let Some(now) = self.doc.borrow().clone() else { return };
+        let moved = {
+            let mut history = self.history.borrow_mut();
+            let History { past, future } = &mut *history;
+            let (from, to) = if back { (past, future) } else { (future, past) };
+            from.pop().inspect(|_| to.push(now))
+        };
+        let Some(then) = moved else { return };
+        *self.doc.borrow_mut() = Some(then);
+        // Whatever was selected may not be there any more.
+        *self.sel.borrow_mut() = None;
+        self.refill_bank();
+        self.changed();
+    }
+
     fn changed(&self) {
         self.sync_detach();
         self.area.queue_draw();
@@ -599,6 +667,7 @@ impl Handle {
     /// there to catch it — which is exactly when a mistake gets made.
     fn detach_selected(&self) {
         let Some(sel) = self.sel.borrow().clone() else { return };
+        self.checkpoint();
         let freed = {
             let mut held = self.doc.borrow_mut();
             let Some(d) = held.as_mut() else { return };
@@ -631,6 +700,7 @@ impl Handle {
 
     fn delete_selected(&self) {
         let Some(sel) = self.sel.borrow_mut().take() else { return };
+        self.checkpoint();
         {
             let mut held = self.doc.borrow_mut();
             let Some(d) = held.as_mut() else { return };
@@ -672,6 +742,7 @@ impl Handle {
                 if text.is_empty() {
                     return;
                 }
+                me.checkpoint();
                 // Into the middle of what is on screen, then dragged into place.
                 let id = {
                     let mut held = me.doc.borrow_mut();

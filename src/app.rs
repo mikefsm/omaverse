@@ -652,6 +652,18 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
                     a.export_pdf();
                     glib::Propagation::Stop
                 }
+                // Undo belongs here, at the window, rather than on the text
+                // view and the outline where it used to live: the diagram
+                // canvas is neither of those, and the keys should mean the same
+                // thing whichever view is showing.
+                gdk::Key::z | gdk::Key::Z => {
+                    if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                        a.redo();
+                    } else {
+                        a.undo();
+                    }
+                    glib::Propagation::Stop
+                }
                 _ => glib::Propagation::Proceed,
             }
         });
@@ -1591,6 +1603,12 @@ impl App {
     /// Step back. Folding is excluded from the history, so undo moves through
     /// edits rather than through the view being tidied around them.
     fn undo(&self) {
+        // A diagram keeps its own history: the text buffer knows nothing about
+        // strokes, and the same keys should mean the same thing in both views.
+        if self.canvas.is_open() {
+            self.canvas.undo();
+            return;
+        }
         if !self.buffer.can_undo() {
             return;
         }
@@ -1599,6 +1617,10 @@ impl App {
     }
 
     fn redo(&self) {
+        if self.canvas.is_open() {
+            self.canvas.redo();
+            return;
+        }
         if !self.buffer.can_redo() {
             return;
         }
