@@ -13,7 +13,10 @@ url="https://github.com/mikefsm/omaverse"
 license=('MIT')
 depends=('gtk4' 'libadwaita' 'enchant' 'cairo' 'pango' 'glib2')
 makedepends=('cargo' 'git')
-optdepends=('hunspell-en_us: spell checking in outlines')
+optdepends=(
+  'ttf-sbl-biblit: SBL BibLit, for setting Greek and Hebrew properly'
+  'hunspell-en_us: spell checking in outlines'
+)
 provides=("$_pkgname")
 conflicts=("$_pkgname")
 source=("git+$url.git")

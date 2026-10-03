@@ -107,14 +107,17 @@ with each subfolder becoming a group in the sidebar. To keep them somewhere else
 
 ### Fonts
 
-Greek and Hebrew are set in SBL BibLit, falling back to SBL Greek and SBL Hebrew.
-These are published by the Society of Biblical Literature and are not packaged
-for Arch, so install them yourself into `~/.local/share/fonts`. Without them
-Omaverse falls back to the system serif, which will render pointed Hebrew and
-polytonic Greek less well but will not fail.
+Greek and Hebrew are set in SBL BibLit, published by the Society of Biblical
+Literature. It is in the AUR and covers Greek, Hebrew and transliteration in one
+family:
 
-Spell checking needs a dictionary: `pacman -S hunspell-en_us`. Without one,
-nothing is marked and nothing breaks.
+```sh
+yay -S ttf-sbl-biblit hunspell-en_us
+```
+
+Neither is required. Without the font Omaverse falls back to the system serif,
+which renders pointed Hebrew and polytonic Greek less well but does not fail;
+without a dictionary nothing is spell checked and nothing breaks.
 
 ## Status
 

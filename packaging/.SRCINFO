@@ -14,6 +14,7 @@ pkgbase = omaverse
 	depends = cairo
 	depends = pango
 	depends = glib2
+	optdepends = ttf-sbl-biblit: SBL BibLit, for setting Greek and Hebrew properly
 	optdepends = hunspell-en_us: spell checking in outlines
 	source = git+https://github.com/mikefsm/omaverse.git#tag=v0.1.0
 	sha256sums = SKIP

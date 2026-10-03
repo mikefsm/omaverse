@@ -18,10 +18,8 @@ license=('MIT')
 depends=('gtk4' 'libadwaita' 'enchant' 'cairo' 'pango' 'glib2')
 makedepends=('cargo' 'git')
 optdepends=(
+  'ttf-sbl-biblit: SBL BibLit, for setting Greek and Hebrew properly'
   'hunspell-en_us: spell checking in outlines'
-  # SBL BibLit, SBL Greek and SBL Hebrew are not packaged for Arch. Omaverse
-  # falls back to the system serif without them; see the README for where the
-  # Society of Biblical Literature publishes them.
 )
 source=("git+$url.git#tag=v$pkgver")
 sha256sums=('SKIP')
