@@ -199,6 +199,14 @@ pub fn export_outline(path: &Path, text: &str, title: &str, sheet: Sheet) -> Don
         let (text, size, indent, space_before, space_after) = match kind {
             // The frontmatter is bookkeeping, and the title is already set.
             Line::Front => continue,
+            // The passage a section is about, set small under its heading.
+            Line::Ref => (
+                docview::ref_marker(raw).unwrap_or("").to_string(),
+                8.5,
+                4.0,
+                0.0,
+                3.0,
+            ),
             Line::Blank => {
                 y += 5.0;
                 continue;

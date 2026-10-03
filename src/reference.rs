@@ -6,11 +6,6 @@
 //! compared and tested for overlap turns "what else do I have on this verse"
 //! into a question with an answer.
 
-// Nothing consumes this yet: it is the groundwork for linking outlines,
-// interlinears and diagrams, and is built and tested first because getting
-// reference parsing wrong would be felt everywhere afterwards.
-#![allow(dead_code)]
-
 use std::fmt;
 
 /// A chapter and verse. Single-chapter books use chapter 1 throughout.

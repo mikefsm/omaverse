@@ -2,6 +2,7 @@
 //! immediate subfolder. Mirrors how `Biblical Studies/` is already organised
 //! (New Testament / Old Testament / ...).
 
+use crate::reference::Reference;
 use std::path::{Path, PathBuf};
 
 /// What kind of document a file holds. An outline is prose, an interlinear is a
@@ -56,6 +57,12 @@ pub fn title_of(path: &Path) -> String {
                 }
             }
         }
+        // An outline names itself in its frontmatter. Falling straight to the
+        // first heading would label the document by its opening section, which
+        // is a different thing and often misleading.
+        if let Some(title) = front_title(&s) {
+            return title;
+        }
         for line in s.lines().take(20) {
             if let Some(rest) = line.strip_prefix("# ") {
                 let t = rest.trim();
@@ -71,6 +78,26 @@ pub fn title_of(path: &Path) -> String {
     path.file_stem()
         .map(|s| s.to_string_lossy().replace(['-', '_'], " "))
         .unwrap_or_else(|| "Untitled".into())
+}
+
+/// The `title:` of a leading `---` frontmatter block, if there is one.
+fn front_title(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+    for line in lines {
+        if line.trim_end() == "---" {
+            return None;
+        }
+        if let Some(rest) = line.trim().strip_prefix("title:") {
+            let t = rest.trim().trim_matches('"').trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn read_head(path: &Path, limit: usize) -> std::io::Result<String> {
@@ -145,6 +172,102 @@ fn collect(
     }
 }
 
+
+/// A passage one document covers. An outline contributes one of these per
+/// section that names a passage; a sheet or a diagram contributes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Covered {
+    pub path: PathBuf,
+    pub kind: Kind,
+    /// The document's own name, for showing in a list.
+    pub title: String,
+    /// The section, when the passage is part of a larger document.
+    pub section: Option<String>,
+    pub reference: Reference,
+}
+
+impl Covered {
+    /// How it reads in a list: "Jude — Those who crept in".
+    pub fn label(&self) -> String {
+        match &self.section {
+            Some(s) => format!("{} — {s}", self.title),
+            None => self.title.clone(),
+        }
+    }
+}
+
+/// Everything in the library that names a passage.
+///
+/// References are read from the files rather than kept in a database: there is
+/// no index to fall out of step, and at the size of a personal library the
+/// whole scan costs a few milliseconds.
+pub fn covered(root: &Path) -> Vec<Covered> {
+    let mut out = Vec::new();
+    for group in scan(root) {
+        for entry in group.entries {
+            collect_references(&entry, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_references(entry: &Entry, out: &mut Vec<Covered>) {
+    let Ok(text) = std::fs::read_to_string(&entry.path) else { return };
+    match entry.kind {
+        Kind::Outline => {
+            // The book is usually named once, by the document; a section says
+            // only its chapter and verse.
+            let book = Reference::parse(&entry.title).and_then(|r| r.book).or_else(|| {
+                (!entry.title.trim().is_empty()).then(|| entry.title.clone())
+            });
+            for (section, text) in crate::docview::section_references(&text) {
+                let Some(mut reference) = Reference::parse(&text) else { continue };
+                if reference.book.is_none() {
+                    reference.book = book.clone();
+                }
+                out.push(Covered {
+                    path: entry.path.clone(),
+                    kind: entry.kind,
+                    title: entry.title.clone(),
+                    section: Some(section),
+                    reference,
+                });
+            }
+        }
+        Kind::Interlinear | Kind::Diagram => {
+            // Their reference is the title: it is what they are named by.
+            if let Some(reference) = Reference::parse(&entry.title) {
+                out.push(Covered {
+                    path: entry.path.clone(),
+                    kind: entry.kind,
+                    title: entry.title.clone(),
+                    section: None,
+                    reference,
+                });
+            }
+        }
+    }
+}
+
+/// What else covers any of the same ground, nearest first. The document asking
+/// is left out of its own answer.
+pub fn related(all: &[Covered], to: &Reference, from: &Path) -> Vec<Covered> {
+    let mut found: Vec<Covered> = all
+        .iter()
+        .filter(|c| c.path != from && c.reference.overlaps(to))
+        .cloned()
+        .collect();
+    // A reference inside the one asked about comes before one that merely
+    // brushes it, and a sheet or diagram before a prose section.
+    found.sort_by_key(|c| {
+        let exact = c.reference != *to;
+        let enclosed = !to.contains(&c.reference);
+        let kind = matches!(c.kind, Kind::Outline);
+        (exact, enclosed, kind, c.label())
+    });
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,12 +282,19 @@ mod tests {
     }
 
     #[test]
-    fn title_prefers_the_heading_then_the_filename() {
+    fn title_prefers_the_frontmatter_then_the_heading_then_the_filename() {
         let d = tmp("titles");
         std::fs::write(d.join("a.md"), "# Romans\n\n- x\n").unwrap();
         std::fs::write(d.join("first_peter.md"), "- x\n").unwrap();
+        // The document is Jude; "Greeting" is only where it starts.
+        std::fs::write(
+            d.join("jude.md"),
+            "---\ntitle: Jude\n---\n\n# Greeting\n\nProse.\n",
+        )
+        .unwrap();
         assert_eq!(title_of(&d.join("a.md")), "Romans");
         assert_eq!(title_of(&d.join("first_peter.md")), "first peter");
+        assert_eq!(title_of(&d.join("jude.md")), "Jude");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -186,6 +316,68 @@ mod tests {
         assert_eq!(groups[1].name.as_deref(), Some("New Testament"));
         let titles: Vec<_> = groups[1].entries.iter().map(|e| e.title.as_str()).collect();
         assert_eq!(titles, ["John", "Romans"], "entries sort by title");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    #[test]
+    fn a_section_reference_takes_the_book_from_its_document() {
+        let d = tmp("covered");
+        std::fs::write(
+            d.join("jude.md"),
+            "---\ntitle: Jude\n---\n\n# Greeting\n<!-- ref: 1-2 -->\n\nProse.\n\n\
+             ## Those who crept in\n<!-- ref: 3-4 -->\n\nMore.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("sheet.toml"),
+            "reference = \"Jude 4\"\nlanguage = \"greek\"\n",
+        )
+        .unwrap();
+
+        let all = covered(&d);
+        assert_eq!(all.len(), 3, "two sections and one sheet");
+
+        let greeting = all.iter().find(|c| c.section.as_deref() == Some("Greeting")).unwrap();
+        assert_eq!(greeting.reference.book.as_deref(), Some("Jude"), "from the title");
+        assert_eq!(greeting.label(), "Jude — Greeting");
+
+        let sheet = all.iter().find(|c| c.kind == Kind::Interlinear).unwrap();
+        assert_eq!(sheet.reference.book.as_deref(), Some("Jude"));
+        assert_eq!(sheet.label(), "Jude 4");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn related_finds_the_overlap_and_leaves_out_the_asker() {
+        let d = tmp("related");
+        std::fs::write(
+            d.join("jude.md"),
+            "---\ntitle: Jude\n---\n\n# Greeting\n<!-- ref: 1-2 -->\n\nProse.\n\n\
+             ## Those who crept in\n<!-- ref: 3-4 -->\n\nMore.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("sheet.toml"),
+            "reference = \"Jude 4\"\nlanguage = \"greek\"\n",
+        )
+        .unwrap();
+        let all = covered(&d);
+
+        // Asking from the sheet about Jude 4.
+        let asking = Reference::parse("Jude 4").unwrap();
+        let found = related(&all, &asking, &d.join("sheet.toml"));
+        let labels: Vec<String> = found.iter().map(|c| c.label()).collect();
+        assert_eq!(labels, ["Jude — Those who crept in"], "verse 4 is in 3-4, not 1-2");
+
+        // Asking from the outline about the whole letter.
+        let whole = Reference::parse("Jude 1-25").unwrap();
+        let found = related(&all, &whole, &d.join("nothing.md"));
+        assert_eq!(found.len(), 3, "everything overlaps it");
+
+        // A different book does not match, however the numbers line up.
+        let elsewhere = Reference::parse("Romans 4").unwrap();
+        assert!(related(&all, &elsewhere, &d.join("nothing.md")).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 

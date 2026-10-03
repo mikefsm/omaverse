@@ -23,7 +23,43 @@ pub enum Line {
     /// A note definition at the foot of the file. Apparatus, not prose, so it
     /// is set apart rather than read as part of the text.
     NoteDef,
+    /// `<!-- ref: 1:1-17 -->` under a heading: which passage the section is
+    /// about. An HTML comment, so every other Markdown reader ignores it.
+    Ref,
     Blank,
+}
+
+/// The passage a `<!-- ref: … -->` line names, if that is what the line is.
+pub fn ref_marker(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let inner = t.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
+    let rest = inner
+        .strip_prefix("ref:")
+        .or_else(|| inner.strip_prefix("ref "))?;
+    let rest = rest.trim();
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// Every section of an outline that names a passage, as (heading, reference
+/// text). Sections without one are left out: a reference is something you add
+/// where it is useful, not a field to fill in everywhere.
+pub fn section_references(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut heading = String::new();
+    for (line, kind) in text.lines().zip(classify(text)) {
+        match kind {
+            Line::Heading { marker, .. } => {
+                heading = line.get(marker..).unwrap_or("").trim().to_string();
+            }
+            Line::Ref => {
+                if let Some(r) = ref_marker(line) {
+                    out.push((heading.clone(), r.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Depths beyond this share the innermost style rather than shrinking forever.
@@ -66,6 +102,10 @@ pub fn classify(text: &str) -> Vec<Line> {
         }
         if trimmed.is_empty() {
             out.push(Line::Blank);
+            continue;
+        }
+        if ref_marker(raw).is_some() {
+            out.push(Line::Ref);
             continue;
         }
         match atx(raw) {
@@ -283,6 +323,16 @@ pub fn install_tags(buffer: &gtk::TextBuffer) {
         .build();
     table.add(&front);
 
+    // The passage a section is about: quiet, since it is a label on the
+    // heading above it rather than something to read.
+    let refmark = gtk::TextTag::builder()
+        .name("refmark")
+        .scale(0.82)
+        .style(gtk::pango::Style::Italic)
+        .left_margin(24)
+        .build();
+    table.add(&refmark);
+
     for (name, build) in [
         ("strong", 0),
         ("em", 1),
@@ -366,6 +416,7 @@ pub fn restyle_range(
             Line::Blank => continue,
             Line::NoteDef => (0, "notedef".to_string()),
             Line::Front => (0, "front".to_string()),
+            Line::Ref => (0, "refmark".to_string()),
             Line::Heading { depth, marker } => (marker, format!("h{}", depth.min(MAX_DEPTH))),
             Line::Body { depth, indent } => (indent, format!("b{}", depth.min(MAX_DEPTH))),
         };
@@ -470,6 +521,59 @@ pub fn heading_lines(text: &str) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reference_marker_is_recognised_but_only_in_its_own_form() {
+        assert_eq!(ref_marker("<!-- ref: 1:1-17 -->"), Some("1:1-17"));
+        assert_eq!(ref_marker("   <!--ref:Jude 4-6-->  "), Some("Jude 4-6"));
+        assert_eq!(ref_marker("<!-- ref 8:1 -->"), Some("8:1"));
+        assert_eq!(ref_marker("<!-- a note to myself -->"), None);
+        assert_eq!(ref_marker("<!-- ref: -->"), None, "nothing named");
+        assert_eq!(ref_marker("ref: 1:1"), None, "not a comment");
+        assert_eq!(ref_marker("# A heading"), None);
+    }
+
+    #[test]
+    fn a_reference_line_is_apparatus_not_prose() {
+        let text = "# Greeting\n<!-- ref: 1-2 -->\nSome prose.\n";
+        let kinds = classify(text);
+        assert!(matches!(kinds[0], Line::Heading { .. }));
+        assert_eq!(kinds[1], Line::Ref);
+        // The reference does not become the body's depth or interrupt it.
+        assert!(matches!(kinds[2], Line::Body { depth: 0, .. }));
+    }
+
+    #[test]
+    fn each_section_keeps_its_own_reference() {
+        let text = r#"---
+title: Jude
+---
+
+# Greeting
+<!-- ref: 1-2 -->
+
+Prose.
+
+## Those who crept in
+<!-- ref: 3-4 -->
+
+More.
+
+# No reference here
+
+Still more.
+"#;
+        let found = section_references(text);
+        assert_eq!(
+            found,
+            vec![
+                ("Greeting".to_string(), "1-2".to_string()),
+                ("Those who crept in".to_string(), "3-4".to_string()),
+            ],
+            "sections without one are simply absent"
+        );
+    }
+
 
     const DOC: &str = "\
 ---

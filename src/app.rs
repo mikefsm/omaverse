@@ -10,6 +10,7 @@ use crate::docview;
 use crate::edit::{self, Cmd};
 use crate::canvas::Canvas;
 use crate::pdfout;
+use crate::reference::Reference;
 use crate::diagram::Diagram;
 use crate::interlinear::Interlinear;
 use crate::library;
@@ -111,6 +112,8 @@ pub struct App {
     gutter: RefCell<Option<gtk::DrawingArea>>,
     /// Shown only while an interlinear is open.
     to_diagram: gtk::Button,
+    /// Shown whenever a document is open.
+    related_btn: gtk::Button,
     /// The paper chosen last time, so the choice does not have to be made twice
     /// in a row.
     last_paper: Cell<usize>,
@@ -309,6 +312,11 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     to_diagram.set_visible(false);
     header.pack_end(&to_diagram);
 
+    let related_btn = gtk::Button::with_label("Related");
+    related_btn.set_tooltip_text(Some("What else covers this passage (Ctrl+R)"));
+    related_btn.set_visible(false);
+    header.pack_end(&related_btn);
+
     let doc_menu = gio::Menu::new();
     doc_menu.append(Some("Library folder…"), Some("win.choose-library"));
     doc_menu.append(Some("Export as PDF…"), Some("win.export-pdf"));
@@ -365,6 +373,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         libbox: libbox.clone(),
         toasts: toasts.clone(),
         to_diagram: to_diagram.clone(),
+        related_btn: related_btn.clone(),
         last_paper: Cell::new(0),
         menu_target: RefCell::new(None),
         last_removal: RefCell::new(None),
@@ -656,6 +665,11 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
                 // view and the outline where it used to live: the diagram
                 // canvas is neither of those, and the keys should mean the same
                 // thing whichever view is showing.
+                gdk::Key::r | gdk::Key::R => {
+                    let anchor = a.related_btn.clone();
+                    a.show_related(anchor.upcast_ref::<gtk::Widget>());
+                    glib::Propagation::Stop
+                }
                 gdk::Key::z | gdk::Key::Z => {
                     if state.contains(gdk::ModifierType::SHIFT_MASK) {
                         a.redo();
@@ -714,6 +728,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         to_diagram.connect_clicked(move |_| a.make_diagram());
+    }
+    {
+        let a = app.clone();
+        related_btn.connect_clicked(move |b| a.show_related(b.upcast_ref::<gtk::Widget>()));
     }
     add_action(&window, "open-outline", {
         let a = app.clone();
@@ -1485,7 +1503,10 @@ impl App {
             docview::Line::Heading { depth, .. } => Some(*depth),
             docview::Line::Body { depth, .. } => Some(*depth),
             // Splitting has no meaning inside the notes at the foot of the file.
-            docview::Line::Blank | docview::Line::NoteDef | docview::Line::Front => None,
+            docview::Line::Blank
+            | docview::Line::NoteDef
+            | docview::Line::Front
+            | docview::Line::Ref => None,
         }) else {
             return;
         };
@@ -2193,6 +2214,7 @@ impl App {
         *self.sheet.borrow_mut() = None;
         self.canvas.clear();
         self.to_diagram.set_visible(false);
+        self.related_btn.set_visible(true);
         *self.path.borrow_mut() = Some(path.clone());
         *self.dstate.borrow_mut() = state::load_doc_state(path);
         *self.selected.borrow_mut() = None;
@@ -2885,6 +2907,7 @@ impl App {
         *self.sheet.borrow_mut() = None;
         self.canvas.clear();
         self.to_diagram.set_visible(false);
+        self.related_btn.set_visible(false);
         self.folds.borrow_mut().clear();
         *self.disk_stamp.borrow_mut() = None;
         self.conflict.set(false);
@@ -2908,6 +2931,202 @@ impl App {
             return;
         };
         self.confirm_trash(&path);
+    }
+
+    // ---- what else covers this passage -------------------------------------
+
+    /// The line of the heading the cursor sits under, if any.
+    fn section_heading_line(&self) -> Option<usize> {
+        let text = self.full_text();
+        let kinds = docview::classify(&text);
+        let at = (self.cursor_line() as usize).min(kinds.len().saturating_sub(1));
+        kinds[..=at]
+            .iter()
+            .rposition(|k| matches!(k, docview::Line::Heading { .. }))
+    }
+
+    /// The passage this section names, exactly as it is written. A reference is
+    /// shown back as it was typed: `3-4` in a one-chapter letter is how it is
+    /// cited, and normalising it to `1:3-4` would be correcting the user.
+    fn section_reference_text(&self) -> Option<String> {
+        let text = self.full_text();
+        let heading = self.section_heading_line()?;
+        let kinds = docview::classify(&text);
+        let lines: Vec<&str> = text.lines().collect();
+        // The reference belongs to this section, so stop at the next heading.
+        for i in heading + 1..lines.len() {
+            if matches!(kinds.get(i), Some(docview::Line::Heading { .. })) {
+                break;
+            }
+            if let Some(r) = docview::ref_marker(lines[i]) {
+                return Some(r.to_string());
+            }
+        }
+        None
+    }
+
+    /// The passage the cursor is in, or that the open sheet or diagram is about.
+    fn current_reference(&self) -> Option<Reference> {
+        if let Some(sheet) = self.sheet.borrow().as_ref() {
+            return Reference::parse(&sheet.reference);
+        }
+        if let Some(diagram) = self.canvas.take() {
+            return Reference::parse(&diagram.reference);
+        }
+        let mut reference = Reference::parse(&self.section_reference_text()?)?;
+        if reference.book.is_none() {
+            reference.book = self.doc.borrow().title.clone();
+        }
+        Some(reference)
+    }
+
+    /// Write the passage this section is about under its heading, replacing one
+    /// already there. Stored as an HTML comment so every other Markdown reader
+    /// passes over it.
+    fn set_section_reference(&self, text: &str) {
+        let Some(heading) = self.section_heading_line() else { return };
+        let full = self.full_text();
+        let kinds = docview::classify(&full);
+        let lines: Vec<&str> = full.lines().collect();
+
+        let mut existing = None;
+        for i in heading + 1..lines.len() {
+            if matches!(kinds.get(i), Some(docview::Line::Heading { .. })) {
+                break;
+            }
+            if docview::ref_marker(lines[i]).is_some() {
+                existing = Some(i);
+                break;
+            }
+        }
+
+        let text = text.trim();
+        let buffer = &self.buffer;
+        match existing {
+            Some(i) => {
+                let mut start = buffer.iter_at_line(i as i32).unwrap_or_else(|| buffer.start_iter());
+                let mut end = buffer
+                    .iter_at_line(i as i32 + 1)
+                    .unwrap_or_else(|| buffer.end_iter());
+                if text.is_empty() {
+                    buffer.delete(&mut start, &mut end);
+                } else {
+                    buffer.delete(&mut start, &mut end);
+                    buffer.insert(&mut start, &format!("<!-- ref: {text} -->\n"));
+                }
+            }
+            None => {
+                if text.is_empty() {
+                    return;
+                }
+                let mut at = buffer
+                    .iter_at_line(heading as i32 + 1)
+                    .unwrap_or_else(|| buffer.end_iter());
+                buffer.insert(&mut at, &format!("<!-- ref: {text} -->\n"));
+            }
+        }
+        self.dirty_doc.set(true);
+        self.dirty_style.set(true);
+    }
+
+    fn show_related(self: &Rc<Self>, anchor: &gtk::Widget) {
+        let popover = gtk::Popover::new();
+        popover.set_parent(anchor);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        column.set_margin_top(10);
+        column.set_margin_bottom(10);
+        column.set_margin_start(10);
+        column.set_margin_end(10);
+        column.set_size_request(320, -1);
+
+        let here = self.current_reference();
+        match &here {
+            Some(reference) => {
+                let caption = gtk::Label::new(Some(&format!("Also on {reference}")));
+                caption.add_css_class("oma-group");
+                caption.set_halign(gtk::Align::Start);
+                column.append(&caption);
+
+                let all = library::covered(&self.cfg.borrow().outline_dir);
+                let mine = self.path.borrow().clone().unwrap_or_default();
+                let found = library::related(&all, reference, &mine);
+                if found.is_empty() {
+                    let none = gtk::Label::new(Some("Nothing else covers it yet."));
+                    none.add_css_class("dim-label");
+                    none.set_halign(gtk::Align::Start);
+                    none.set_wrap(true);
+                    column.append(&none);
+                } else {
+                    let list = gtk::ListBox::new();
+                    list.add_css_class("boxed-list");
+                    for c in found {
+                        let row = adw::ActionRow::builder()
+                            .title(c.label())
+                            .subtitle(match c.kind {
+                                library::Kind::Outline => "outline",
+                                library::Kind::Interlinear => "interlinear",
+                                library::Kind::Diagram => "diagram",
+                            })
+                            .activatable(true)
+                            .build();
+                        let me = self.clone();
+                        let popover = popover.clone();
+                        let path = c.path.clone();
+                        row.connect_activated(move |_| {
+                            popover.popdown();
+                            me.open(&path);
+                        });
+                        list.append(&row);
+                    }
+                    column.append(&list);
+                }
+            }
+            None => {
+                let none = gtk::Label::new(Some(
+                    "This section does not say which passage it is about.",
+                ));
+                none.add_css_class("dim-label");
+                none.set_halign(gtk::Align::Start);
+                none.set_wrap(true);
+                column.append(&none);
+            }
+        }
+
+        // Only an outline section can be named here; a sheet and a diagram are
+        // named by their own reference field.
+        if self.sheet.borrow().is_none() && self.canvas.take().is_none() && self.path.borrow().is_some()
+        {
+            column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            let caption = gtk::Label::new(Some("This section is about"));
+            caption.add_css_class("oma-group");
+            caption.set_halign(gtk::Align::Start);
+            column.append(&caption);
+
+            let entry = gtk::Entry::builder()
+                .placeholder_text("1:1-17, or Jude 4")
+                .text(self.section_reference_text().unwrap_or_default())
+                .build();
+            column.append(&entry);
+            let hint = gtk::Label::new(Some(
+                "Kept as an HTML comment, so other Markdown readers ignore it. \
+                 Leave it empty to remove.",
+            ));
+            hint.add_css_class("dim-label");
+            hint.set_wrap(true);
+            hint.set_xalign(0.0);
+            column.append(&hint);
+
+            let me = self.clone();
+            let popover_for_entry = popover.clone();
+            entry.connect_activate(move |e| {
+                me.set_section_reference(&e.text());
+                popover_for_entry.popdown();
+            });
+        }
+
+        popover.set_child(Some(&column));
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
     }
 
     // ---- printing ----------------------------------------------------------
@@ -3129,6 +3348,7 @@ impl App {
         };
         *self.sheet.borrow_mut() = None;
         self.to_diagram.set_visible(false);
+        self.related_btn.set_visible(true);
         *self.path.borrow_mut() = Some(path.clone());
         self.record_stamp(path);
         self.conflict.set(false);
@@ -3196,6 +3416,7 @@ impl App {
         self.grid.show(&sheet);
         *self.sheet.borrow_mut() = Some(sheet);
         self.to_diagram.set_visible(true);
+        self.related_btn.set_visible(true);
         self.stack.set_visible_child_name("interlinear");
         self.split.set_show_sidebar(true);
 
