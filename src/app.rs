@@ -114,6 +114,8 @@ pub struct App {
     to_diagram: gtk::Button,
     /// Shown whenever a document is open.
     related_btn: gtk::Button,
+    /// Shown only for a diagram that remembers its sheet.
+    to_sheet: gtk::Button,
     /// The paper chosen last time, so the choice does not have to be made twice
     /// in a row.
     last_paper: Cell<usize>,
@@ -312,6 +314,11 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     to_diagram.set_visible(false);
     header.pack_end(&to_diagram);
 
+    let to_sheet = gtk::Button::with_label("Sheet");
+    to_sheet.set_tooltip_text(Some("Open the interlinear this diagram came from"));
+    to_sheet.set_visible(false);
+    header.pack_end(&to_sheet);
+
     let related_btn = gtk::Button::with_label("Related");
     related_btn.set_tooltip_text(Some("What else covers this passage (Ctrl+R)"));
     related_btn.set_visible(false);
@@ -374,6 +381,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         toasts: toasts.clone(),
         to_diagram: to_diagram.clone(),
         related_btn: related_btn.clone(),
+        to_sheet: to_sheet.clone(),
         last_paper: Cell::new(0),
         menu_target: RefCell::new(None),
         last_removal: RefCell::new(None),
@@ -420,7 +428,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     }
     {
         let a = app.clone();
-        app.canvas.connect_open_source(move |name| a.open_beside(&name));
+        app.canvas.connect_resync(move |name| a.resync_diagram(&name));
     }
     {
         let a = app.clone();
@@ -732,6 +740,14 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         related_btn.connect_clicked(move |b| a.show_related(b.upcast_ref::<gtk::Widget>()));
+    }
+    {
+        let a = app.clone();
+        to_sheet.connect_clicked(move |_| {
+            if let Some(name) = a.canvas.source() {
+                a.open_beside(&name);
+            }
+        });
     }
     add_action(&window, "open-outline", {
         let a = app.clone();
@@ -2214,6 +2230,7 @@ impl App {
         *self.sheet.borrow_mut() = None;
         self.canvas.clear();
         self.to_diagram.set_visible(false);
+        self.to_sheet.set_visible(false);
         self.related_btn.set_visible(true);
         *self.path.borrow_mut() = Some(path.clone());
         *self.dstate.borrow_mut() = state::load_doc_state(path);
@@ -2907,6 +2924,7 @@ impl App {
         *self.sheet.borrow_mut() = None;
         self.canvas.clear();
         self.to_diagram.set_visible(false);
+        self.to_sheet.set_visible(false);
         self.related_btn.set_visible(false);
         self.folds.borrow_mut().clear();
         *self.disk_stamp.borrow_mut() = None;
@@ -3335,6 +3353,35 @@ impl App {
         }
     }
 
+    /// Re-read the sheet a diagram came from. A diagram is made once and then
+    /// worked on for a long time, while the sheet underneath it keeps being
+    /// corrected; without this the two drift apart silently.
+    fn resync_diagram(&self, name: &str) {
+        let Some(dir) = self.path.borrow().as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        else {
+            return;
+        };
+        let target = dir.join(name);
+        let Ok(text) = std::fs::read_to_string(&target) else {
+            self.wtitle.set_subtitle(&format!("{name} is not beside this diagram"));
+            return;
+        };
+        let sheet = match Interlinear::parse(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                self.wtitle.set_subtitle(&format!("Could not read {name} — {e}"));
+                self.wtitle.add_css_class("oma-error");
+                return;
+            }
+        };
+        let Some(mut diagram) = self.canvas.take() else { return };
+        let report = diagram.sync_from(&sheet);
+        if !report.is_nothing() {
+            self.canvas.apply(diagram);
+        }
+        self.toasts.add_toast(adw::Toast::new(&report.summary()));
+    }
+
     fn open_diagram(&self, path: &PathBuf) {
         let src = std::fs::read_to_string(path).unwrap_or_default();
         let diagram = match Diagram::parse(&src) {
@@ -3348,6 +3395,7 @@ impl App {
         };
         *self.sheet.borrow_mut() = None;
         self.to_diagram.set_visible(false);
+        self.to_sheet.set_visible(diagram.source.is_some());
         self.related_btn.set_visible(true);
         *self.path.borrow_mut() = Some(path.clone());
         self.record_stamp(path);
@@ -3416,6 +3464,7 @@ impl App {
         self.grid.show(&sheet);
         *self.sheet.borrow_mut() = Some(sheet);
         self.to_diagram.set_visible(true);
+        self.to_sheet.set_visible(false);
         self.related_btn.set_visible(true);
         self.stack.set_visible_child_name("interlinear");
         self.split.set_show_sidebar(true);

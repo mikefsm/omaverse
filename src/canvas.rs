@@ -65,7 +65,7 @@ pub struct Canvas {
     rtl: Rc<Cell<bool>>,
     history: Rc<RefCell<History>>,
     /// Shown only when the diagram remembers the sheet it came from.
-    to_source: gtk::Button,
+    resync: gtk::Button,
     /// Live only while something held is selected, so it says what is attached.
     detach: gtk::Button,
 }
@@ -144,10 +144,12 @@ impl Canvas {
         delete.set_tooltip_text(Some("Remove what is selected (Delete)"));
         palette.append(&delete);
 
-        let to_source = gtk::Button::with_label("Sheet");
-        to_source.set_tooltip_text(Some("Open the interlinear this came from"));
-        to_source.set_visible(false);
-        palette.append(&to_source);
+        let resync = gtk::Button::from_icon_name("view-refresh-symbolic");
+        resync.set_tooltip_text(Some(
+            "Re-read the interlinear: take its corrections and any words it has gained",
+        ));
+        resync.set_visible(false);
+        palette.append(&resync);
 
         let hint = gtk::Label::new(Some("Pick a stroke, then click where it goes"));
         hint.add_css_class("dim-label");
@@ -205,7 +207,7 @@ impl Canvas {
             on_change: on_change.clone(),
             rtl: rtl.clone(),
             history: history.clone(),
-            to_source: to_source.clone(),
+            resync: resync.clone(),
             detach: detach.clone(),
         };
 
@@ -252,10 +254,10 @@ impl Canvas {
         *self.on_change.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Called with the diagram's `source` when the sheet behind it is wanted.
-    pub fn connect_open_source(&self, f: impl Fn(String) + 'static) {
+    /// Called with the diagram's `source` when the sheet should be re-read.
+    pub fn connect_resync(&self, f: impl Fn(String) + 'static) {
         let doc = self.doc.clone();
-        self.to_source.connect_clicked(move |_| {
+        self.resync.connect_clicked(move |_| {
             let source = doc.borrow().as_ref().and_then(|d| d.source.clone());
             if let Some(source) = source {
                 f(source);
@@ -263,11 +265,26 @@ impl Canvas {
         });
     }
 
+    /// Replace the diagram wholesale, as an undoable step.
+    pub fn apply(&self, diagram: Diagram) {
+        let h = self.handle();
+        h.checkpoint();
+        *self.doc.borrow_mut() = Some(diagram);
+        *self.sel.borrow_mut() = None;
+        h.refill_bank();
+        h.changed();
+    }
+
+    /// The interlinear this diagram was made from, if it remembers one.
+    pub fn source(&self) -> Option<String> {
+        self.doc.borrow().as_ref().and_then(|d| d.source.clone())
+    }
+
     pub fn show(&self, diagram: Diagram, rtl: bool) {
         self.rtl.set(rtl);
         *self.sel.borrow_mut() = None;
         *self.history.borrow_mut() = History::default();
-        self.to_source.set_visible(diagram.source.is_some());
+        self.resync.set_visible(diagram.source.is_some());
         *self.doc.borrow_mut() = Some(diagram);
         self.handle().refill_bank();
         self.area.queue_draw();

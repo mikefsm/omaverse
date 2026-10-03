@@ -218,6 +218,64 @@ impl Diagram {
         d
     }
 
+    /// What re-reading the sheet changed.
+    pub fn sync_from(&mut self, sheet: &Interlinear) -> Sync {
+        let mut report = Sync::default();
+
+        // Follow the sheet's order, keeping each word's own text up to date.
+        let mut fresh: Vec<BankWord> = Vec::new();
+        for w in &sheet.words {
+            match self.words.iter().find(|b| b.id == w.id) {
+                Some(old) => {
+                    if old.text != w.text || old.gloss != w.gloss {
+                        report.updated += 1;
+                    }
+                }
+                None => report.added += 1,
+            }
+            fresh.push(BankWord {
+                id: w.id.clone(),
+                text: w.text.clone(),
+                gloss: w.gloss.clone(),
+            });
+        }
+
+        // A word taken out of the sheet is only dropped here if it was never
+        // used. One already on the canvas stays: the drawing is the work, and
+        // removing strokes from under it would be worse than a stale word.
+        for old in &self.words {
+            if sheet.word(&old.id).is_none() {
+                if self.labels.iter().any(|l| l.word.as_deref() == Some(&old.id)) {
+                    report.orphaned += 1;
+                    fresh.push(old.clone());
+                } else {
+                    report.removed += 1;
+                }
+            }
+        }
+
+        self.words = fresh;
+
+        // A word already placed shows the sheet's spelling, not the one it was
+        // carried over with.
+        let renames: Vec<(String, String)> = self
+            .labels
+            .iter()
+            .filter_map(|l| {
+                let id = l.word.as_deref()?;
+                let now = sheet.word(id)?;
+                (now.text != l.text).then(|| (l.id.clone(), now.text.clone()))
+            })
+            .collect();
+        report.relabelled = renames.len();
+        for (label, text) in renames {
+            if let Some(l) = self.label_mut(&label) {
+                l.text = text;
+            }
+        }
+        report
+    }
+
     pub fn parse(text: &str) -> Result<Diagram, toml::de::Error> {
         let mut d: Diagram = toml::from_str(text)?;
         d.tidy();
@@ -621,6 +679,52 @@ impl Diagram {
                 return id;
             }
         }
+    }
+}
+
+/// The result of re-reading the sheet a diagram came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sync {
+    /// Words whose text or gloss the sheet has changed.
+    pub updated: usize,
+    /// Words the sheet has gained.
+    pub added: usize,
+    /// Words the sheet no longer has, which were never placed.
+    pub removed: usize,
+    /// Words the sheet no longer has, but which are on the canvas.
+    pub orphaned: usize,
+    /// Words already placed whose spelling on the canvas was corrected.
+    pub relabelled: usize,
+}
+
+impl Sync {
+    pub fn is_nothing(&self) -> bool {
+        *self == Sync::default()
+    }
+
+    /// How it reads in a message.
+    pub fn summary(&self) -> String {
+        if self.is_nothing() {
+            return "Already up to date with the sheet".to_string();
+        }
+        let mut parts = Vec::new();
+        let plural = |n: usize| if n == 1 { "word" } else { "words" };
+        if self.added > 0 {
+            parts.push(format!("{} new {}", self.added, plural(self.added)));
+        }
+        if self.updated > 0 {
+            parts.push(format!("{} changed", self.updated));
+        }
+        if self.removed > 0 {
+            parts.push(format!("{} dropped", self.removed));
+        }
+        if self.orphaned > 0 {
+            parts.push(format!(
+                "{} no longer in the sheet but still drawn",
+                self.orphaned
+            ));
+        }
+        parts.join(", ")
     }
 }
 
@@ -1088,6 +1192,65 @@ mod tests {
         // And it no longer travels with the stroke it used to sit on.
         d.shift_line(&base, 0.0, 50.0);
         assert_eq!(d.anchor_of(d.label(&label).unwrap()).1, y);
+    }
+
+    #[test]
+    fn re_reading_the_sheet_brings_the_diagram_up_to_date() {
+        let mut s = sheet(); // alpha beta gamma, w1 glossed "first"
+        let mut d = Diagram::from_interlinear(&s, Some("s.toml".into()));
+        let placed = d.place("w2", 10.0, 10.0).unwrap();
+
+        // The sheet moves on: a word is corrected, one is added, one removed.
+        s.word_mut("w2").unwrap().text = "beta corrected".into();
+        s.append_text("delta");
+        s.remove_word("w3");
+
+        let report = d.sync_from(&s);
+        assert_eq!(report.updated, 1, "beta");
+        assert_eq!(report.added, 1, "delta");
+        assert_eq!(report.removed, 1, "gamma was never placed");
+        assert_eq!(report.orphaned, 0);
+        assert_eq!(report.relabelled, 1, "the placed word was respelled");
+
+        let ids: Vec<&str> = d.words.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["w1", "w2", "w4"], "in the sheet's order");
+        assert_eq!(d.label(&placed).unwrap().text, "beta corrected");
+        let bank: Vec<&str> = d.bank().iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(bank, ["alpha", "delta"], "the placed word is not in the bank");
+    }
+
+    #[test]
+    fn a_word_removed_from_the_sheet_but_drawn_is_kept() {
+        let mut s = sheet();
+        let mut d = Diagram::from_interlinear(&s, None);
+        let placed = d.place("w3", 10.0, 10.0).unwrap();
+        s.remove_word("w3");
+
+        let report = d.sync_from(&s);
+        assert_eq!(report.orphaned, 1);
+        assert_eq!(report.removed, 0);
+        assert!(d.label(&placed).is_some(), "the drawing is not disturbed");
+        assert_eq!(d.words.len(), 3, "and the word it refers to is still known");
+    }
+
+    #[test]
+    fn re_reading_an_unchanged_sheet_changes_nothing() {
+        let s = sheet();
+        let mut d = Diagram::from_interlinear(&s, None);
+        let before = d.clone();
+        let report = d.sync_from(&s);
+        assert!(report.is_nothing(), "got {report:?}");
+        assert_eq!(report.summary(), "Already up to date with the sheet");
+        assert_eq!(d, before);
+    }
+
+    #[test]
+    fn the_summary_says_what_happened() {
+        let mut s = sheet();
+        let mut d = Diagram::from_interlinear(&s, None);
+        s.append_text("delta epsilon");
+        let report = d.sync_from(&s);
+        assert_eq!(report.summary(), "2 new words");
     }
 
     #[test]
