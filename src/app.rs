@@ -114,6 +114,8 @@ pub struct App {
     /// The paper chosen last time, so the choice does not have to be made twice
     /// in a row.
     last_paper: Cell<usize>,
+    /// The sidebar row a context menu was opened on.
+    menu_target: RefCell<Option<PathBuf>>,
     toasts: adw::ToastOverlay,
     /// The undo offer for the last removed word. Only the most recent removal
     /// can be taken back: an older offer would put its word back at an index
@@ -309,6 +311,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
 
     let doc_menu = gio::Menu::new();
     doc_menu.append(Some("Export as PDF…"), Some("win.export-pdf"));
+    doc_menu.append(Some("Move to Trash…"), Some("win.trash-open"));
     let doc_btn = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .tooltip_text("This document")
@@ -362,6 +365,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         toasts: toasts.clone(),
         to_diagram: to_diagram.clone(),
         last_paper: Cell::new(0),
+        menu_target: RefCell::new(None),
         last_removal: RefCell::new(None),
         lib_paths: RefCell::new(Vec::new()),
         recent: RefCell::new(wstate.recent.clone()),
@@ -437,6 +441,29 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         libbox.connect_row_activated(move |_, row| a.on_library_activated(row));
+    }
+    {
+        // A menu on the entry itself, so a document can be dealt with without
+        // opening it first.
+        let a = app.clone();
+        let menu = gio::Menu::new();
+        menu.append(Some("Move to Trash…"), Some("win.trash-listed"));
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(&libbox);
+        popover.set_has_arrow(false);
+        popover.set_halign(gtk::Align::Start);
+
+        let right_click = gtk::GestureClick::new();
+        right_click.set_button(gdk::BUTTON_SECONDARY);
+        let box_for_menu = libbox.clone();
+        right_click.connect_pressed(move |_, _, x, y| {
+            let Some(row) = box_for_menu.row_at_y(y as i32) else { return };
+            let Some(path) = a.path_for_row(&row) else { return };
+            *a.menu_target.borrow_mut() = Some(path);
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        });
+        libbox.add_controller(right_click);
     }
     {
         let a = app.clone();
@@ -650,6 +677,14 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     add_action(&window, "new-interlinear", {
         let a = app.clone();
         move || a.new_interlinear()
+    });
+    add_action(&window, "trash-open", {
+        let a = app.clone();
+        move || a.trash_open_document()
+    });
+    add_action(&window, "trash-listed", {
+        let a = app.clone();
+        move || a.trash_from_sidebar()
     });
     add_action(&window, "export-pdf", {
         let a = app.clone();
@@ -1759,6 +1794,16 @@ impl App {
         docview::heading_lines(&text).get(idx).copied()
     }
 
+    /// The document a sidebar row stands for, if it stands for one: group
+    /// headers and the empty-library notice do not.
+    fn path_for_row(&self, row: &gtk::ListBoxRow) -> Option<PathBuf> {
+        let index = row.index();
+        if index < 0 {
+            return None;
+        }
+        self.lib_paths.borrow().get(index as usize).cloned().flatten()
+    }
+
     fn path_at_index(&self, index: usize) -> Option<NodePath> {
         self.doc.borrow().walk().get(index).map(|(p, _)| p.clone())
     }
@@ -2683,6 +2728,140 @@ impl App {
         }
     }
 
+    // ---- getting rid of a document -----------------------------------------
+
+    /// Ask first, and say plainly what is going. The file goes to the desktop
+    /// trash rather than being unlinked: a document is a year of someone's
+    /// study, and the one thing worse than deleting it is deleting it for good.
+    fn confirm_trash(self: &Rc<Self>, path: &Path) {
+        let name = self.pretty(path);
+        let title = library::title_of(path);
+        let dlg = adw::AlertDialog::new(
+            Some(&format!("Move “{title}” to the trash?")),
+            Some(&format!("{name}\n\nIt can be put back from your file manager.")),
+        );
+        dlg.add_response("cancel", "Cancel");
+        dlg.add_response("trash", "Move to Trash");
+        dlg.set_response_appearance("trash", adw::ResponseAppearance::Destructive);
+        dlg.set_default_response(Some("cancel"));
+        dlg.set_close_response("cancel");
+
+        let me = self.clone();
+        let path = path.to_path_buf();
+        dlg.connect_response(None, move |_, answer| {
+            if answer == "trash" {
+                me.trash(&path);
+            }
+        });
+        dlg.present(Some(&self.window));
+    }
+
+    fn trash(self: &Rc<Self>, path: &Path) {
+        // Read the title while the file is still there to read it from.
+        let title = library::title_of(path);
+        if let Err(e) = gio::File::for_path(path).trash(gio::Cancellable::NONE) {
+            // Not every filesystem has a trash — a memory-backed directory or a
+            // stick formatted elsewhere has nowhere to put it. Rather than
+            // leave the document undeletable, say so and ask again, because
+            // this time there is no way back.
+            eprintln!("omaverse: could not trash {}: {e}", path.display());
+            self.confirm_erase(path, &e.to_string());
+            return;
+        }
+
+        self.after_removal(path, "Moved to the trash:", &title);
+    }
+
+    /// The second asking, when there is no trash to move the file to. This one
+    /// really does destroy it, so it says so and nothing is the default.
+    fn confirm_erase(self: &Rc<Self>, path: &Path, why: &str) {
+        let title = library::title_of(path);
+        let named = title.clone();
+        let dlg = adw::AlertDialog::new(
+            Some(&format!("Delete “{title}” for good?")),
+            Some(&format!(
+                "{}\n\nIt could not be moved to the trash: {why}. Deleting it here \
+                 removes it from the disk, and it cannot be put back.",
+                self.pretty(path)
+            )),
+        );
+        dlg.add_response("cancel", "Cancel");
+        dlg.add_response("erase", "Delete Permanently");
+        dlg.set_response_appearance("erase", adw::ResponseAppearance::Destructive);
+        dlg.set_default_response(Some("cancel"));
+        dlg.set_close_response("cancel");
+
+        let me = self.clone();
+        let path = path.to_path_buf();
+        dlg.connect_response(None, move |_, answer| {
+            if answer != "erase" {
+                me.wtitle.set_subtitle(&me.pretty(&path));
+                me.wtitle.remove_css_class("oma-error");
+                return;
+            }
+            if let Err(e) = std::fs::remove_file(&path) {
+                eprintln!("omaverse: could not delete {}: {e}", path.display());
+                me.wtitle.set_subtitle(&format!("Not deleted — {e}"));
+                me.wtitle.add_css_class("oma-error");
+                return;
+            }
+            me.after_removal(&path, "Deleted", &named);
+        });
+        dlg.present(Some(&self.window));
+    }
+
+    /// Tidy up once a document has actually gone, however it went. Nothing here
+    /// runs until the file is really gone, so cancelling leaves the document
+    /// exactly as it was.
+    fn after_removal(self: &Rc<Self>, path: &Path, verb: &str, title: &str) {
+        if self.path.borrow().as_deref() == Some(path) {
+            // Anything still pending belongs to a document that no longer
+            // exists, so drop it rather than writing it back out.
+            self.dirty_doc.set(false);
+            self.dirty_state.set(false);
+            self.dismiss_removal_offer();
+        }
+        state::forget_doc(path);
+        self.recent.borrow_mut().retain(|p| p != path);
+        if self.path.borrow().as_deref() == Some(path) {
+            self.close_document();
+        }
+        self.refresh_library();
+        self.save_window_state();
+        self.toasts.add_toast(adw::Toast::new(&format!("{verb} “{title}”")));
+    }
+
+    /// Put the window back to having nothing open.
+    fn close_document(&self) {
+        *self.path.borrow_mut() = None;
+        *self.sheet.borrow_mut() = None;
+        self.canvas.clear();
+        self.to_diagram.set_visible(false);
+        self.folds.borrow_mut().clear();
+        *self.disk_stamp.borrow_mut() = None;
+        self.conflict.set(false);
+        self.conflict_asked.set(false);
+        self.stack.set_visible_child_name("empty");
+        self.wtitle.set_title("Omaverse");
+        self.wtitle.set_subtitle("");
+        self.wtitle.remove_css_class("oma-error");
+        self.window.set_title(Some("Omaverse"));
+    }
+
+    /// The document the sidebar's own menu is about.
+    fn trash_from_sidebar(self: &Rc<Self>) {
+        let Some(path) = self.menu_target.borrow().clone() else { return };
+        self.confirm_trash(&path);
+    }
+
+    fn trash_open_document(self: &Rc<Self>) {
+        let Some(path) = self.path.borrow().clone() else {
+            self.wtitle.set_subtitle("Nothing open to delete");
+            return;
+        };
+        self.confirm_trash(&path);
+    }
+
     // ---- printing ----------------------------------------------------------
 
     /// Ask for paper and orientation, then where to put it. Every kind of
@@ -2986,8 +3165,11 @@ impl App {
     // ---- library -----------------------------------------------------------
 
     fn refresh_library(&self) {
-        while let Some(child) = self.libbox.first_child() {
-            self.libbox.remove(&child);
+        // Rows only: the list also holds its context menu as a child, and a
+        // ListBox refuses to remove anything that is not a row — so clearing by
+        // first_child never terminates.
+        while let Some(row) = self.libbox.row_at_index(0) {
+            self.libbox.remove(&row);
         }
         let mut paths: Vec<Option<PathBuf>> = Vec::new();
         let groups = library::scan(&self.cfg.outline_dir);

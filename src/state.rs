@@ -104,6 +104,12 @@ pub fn save_doc_state(doc: &Path, st: &DocState) {
     write_json(&state_dir().join("docs").join(doc_key(doc)), st);
 }
 
+/// Drop what was remembered about a document. Called when it goes, so a new
+/// file that later takes the same name does not inherit its folds.
+pub fn forget_doc(doc: &Path) {
+    let _ = std::fs::remove_file(state_dir().join("docs").join(doc_key(doc)));
+}
+
 /// Where a side of a conflict is parked before the other one wins. Deliberately
 /// outside the outline directory: it is a safety net, not a document, and should
 /// not appear in the library or sync anywhere.
