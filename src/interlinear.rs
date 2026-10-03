@@ -13,6 +13,7 @@
 // identity has to be right before anything refers to a word.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,7 +55,15 @@ pub struct Word {
     /// Your own remark on this word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Anything else this sheet has chosen to record: discourse function,
+    /// textual variants, whatever the passage asks for. Written out beside the
+    /// four standard fields and read back the same way.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, String>,
 }
+
+/// The fields every sheet understands, whether or not it shows them.
+pub const STANDARD_FIELDS: [&str; 4] = ["gloss", "lemma", "parse", "note"];
 
 impl Word {
     pub fn new(id: impl Into<String>, text: impl Into<String>) -> Word {
@@ -65,6 +74,7 @@ impl Word {
             lemma: None,
             parse: None,
             note: None,
+            extra: BTreeMap::new(),
         }
     }
 
@@ -74,7 +84,7 @@ impl Word {
             "lemma" => self.lemma.as_deref(),
             "parse" => self.parse.as_deref(),
             "note" => self.note.as_deref(),
-            _ => None,
+            other => self.extra.get(other).map(|s| s.as_str()),
         }
     }
 
@@ -85,7 +95,14 @@ impl Word {
             "lemma" => self.lemma = value,
             "parse" => self.parse = value,
             "note" => self.note = value,
-            _ => {}
+            other => match value {
+                Some(v) => {
+                    self.extra.insert(other.to_string(), v);
+                }
+                None => {
+                    self.extra.remove(other);
+                }
+            },
         }
     }
 }
@@ -152,6 +169,40 @@ impl Interlinear {
 
     pub fn word(&self, id: &str) -> Option<&Word> {
         self.words.iter().find(|w| w.id == id)
+    }
+
+    /// Every field this sheet could show: the ones it has chosen, then the
+    /// standard ones it has not, so the editor offers all of them in an order
+    /// that puts what the sheet cares about first.
+    pub fn fields(&self) -> Vec<String> {
+        let mut names = self.rows.clone();
+        for standard in STANDARD_FIELDS {
+            if !names.iter().any(|n| n == standard) {
+                names.push(standard.to_string());
+            }
+        }
+        // A word may carry something no row names, from a file edited by hand.
+        for word in &self.words {
+            for name in word.extra.keys() {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
+    }
+
+    /// Change which fields are shown beneath each word. Names are trimmed, the
+    /// empty ones dropped, and duplicates collapsed.
+    pub fn set_rows(&mut self, names: &[String]) {
+        let mut rows: Vec<String> = Vec::new();
+        for n in names {
+            let n = n.trim();
+            if !n.is_empty() && !rows.iter().any(|r| r == n) {
+                rows.push(n.to_string());
+            }
+        }
+        self.rows = rows;
     }
 
     pub fn word_mut(&mut self, id: &str) -> Option<&mut Word> {
@@ -371,6 +422,69 @@ mod tests {
         let back = Interlinear::parse(&sheet.to_toml()).expect("should parse");
         assert_eq!(back.word("w1").unwrap().field("note"), Some("worth saying"));
         assert_eq!(back.rows, ["gloss"]);
+    }
+
+    #[test]
+    fn a_sheet_can_name_its_own_fields() {
+        let mut sheet = Interlinear::new("Romans 8:4", Language::Greek);
+        sheet.set_rows(&["gloss".into(), "discourse".into(), "variant".into()]);
+        sheet.append_text("alpha");
+        let w = sheet.word_mut("w1").unwrap();
+        w.set_field("gloss", "first");
+        w.set_field("discourse", "topic shift");
+        w.set_field("variant", "P46 omits");
+
+        assert_eq!(sheet.word("w1").unwrap().field("discourse"), Some("topic shift"));
+        let text = sheet.to_toml();
+        assert!(text.contains("discourse = \"topic shift\""), "got: {text}");
+
+        let back = Interlinear::parse(&text).expect("should parse");
+        assert_eq!(back, sheet, "a field it invented survives the round trip");
+        assert_eq!(back.rows, ["gloss", "discourse", "variant"]);
+    }
+
+    #[test]
+    fn an_invented_field_is_cleared_like_any_other() {
+        let mut sheet = Interlinear::new("Romans 8:4", Language::Greek);
+        sheet.append_text("alpha");
+        let w = sheet.word_mut("w1").unwrap();
+        w.set_field("discourse", "topic shift");
+        assert_eq!(w.extra.len(), 1);
+        w.set_field("discourse", "   ");
+        assert_eq!(w.field("discourse"), None);
+        assert!(w.extra.is_empty(), "blanking removes it rather than storing nothing");
+        assert!(!sheet.to_toml().contains("discourse"));
+    }
+
+    #[test]
+    fn rows_are_tidied_and_the_editor_offers_the_standard_four_as_well() {
+        let mut sheet = Interlinear::new("Romans 8:4", Language::Greek);
+        sheet.set_rows(&[" discourse ".into(), "".into(), "discourse".into(), "gloss".into()]);
+        assert_eq!(sheet.rows, ["discourse", "gloss"], "trimmed, deduped, no blanks");
+
+        // What the sheet shows comes first; the rest are still fillable.
+        assert_eq!(sheet.fields(), ["discourse", "gloss", "lemma", "parse", "note"]);
+    }
+
+    #[test]
+    fn a_field_only_a_word_carries_is_still_offered() {
+        // A file edited by hand can name a field no row mentions.
+        let sheet = Interlinear::parse(
+            "reference = \"Jude 4\"\nlanguage = \"greek\"\nrows = [\"gloss\"]\n\n             [[words]]\nid = \"w1\"\ntext = \"alpha\"\nsyntax = \"predicate\"\n",
+        )
+        .expect("should parse");
+        assert_eq!(sheet.word("w1").unwrap().field("syntax"), Some("predicate"));
+        assert!(sheet.fields().contains(&"syntax".to_string()));
+    }
+
+    #[test]
+    fn a_sheet_that_names_nothing_extra_is_written_exactly_as_before() {
+        let mut sheet = Interlinear::new("Jude 4", Language::Greek);
+        sheet.append_text("alpha");
+        sheet.word_mut("w1").unwrap().set_field("gloss", "first");
+        let text = sheet.to_toml();
+        assert!(!text.contains("extra"), "the map is not a key in the file");
+        assert_eq!(Interlinear::parse(&text).unwrap(), sheet);
     }
 
     #[test]

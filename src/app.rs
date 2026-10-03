@@ -116,6 +116,8 @@ pub struct App {
     related_btn: gtk::Button,
     /// Shown only for a diagram that remembers its sheet.
     to_sheet: gtk::Button,
+    /// Shown only while an interlinear is open.
+    rows_btn: gtk::Button,
     /// The paper chosen last time, so the choice does not have to be made twice
     /// in a row.
     last_paper: Cell<usize>,
@@ -318,6 +320,11 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     to_diagram.set_visible(false);
     header.pack_end(&to_diagram);
 
+    let rows_btn = gtk::Button::with_label("Rows");
+    rows_btn.set_tooltip_text(Some("Choose what is written under each word"));
+    rows_btn.set_visible(false);
+    header.pack_end(&rows_btn);
+
     let to_sheet = gtk::Button::with_label("Sheet");
     to_sheet.set_tooltip_text(Some("Open the interlinear this diagram came from"));
     to_sheet.set_visible(false);
@@ -386,6 +393,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         to_diagram: to_diagram.clone(),
         related_btn: related_btn.clone(),
         to_sheet: to_sheet.clone(),
+        rows_btn: rows_btn.clone(),
         last_paper: Cell::new(0),
         menu_target: RefCell::new(None),
         last_removal: RefCell::new(None),
@@ -752,6 +760,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     {
         let a = app.clone();
         find_btn.connect_clicked(move |_| a.show_search());
+    }
+    {
+        let a = app.clone();
+        rows_btn.connect_clicked(move |b| a.edit_rows(b.upcast_ref::<gtk::Widget>()));
     }
     {
         let a = app.clone();
@@ -2243,6 +2255,7 @@ impl App {
         self.canvas.clear();
         self.to_diagram.set_visible(false);
         self.to_sheet.set_visible(false);
+        self.rows_btn.set_visible(false);
         self.related_btn.set_visible(true);
         *self.path.borrow_mut() = Some(path.clone());
         *self.dstate.borrow_mut() = state::load_doc_state(path);
@@ -2531,15 +2544,98 @@ impl App {
 
     // ---- editing a word ----------------------------------------------------
 
-    /// The fields a word can carry. The sheet's `rows` decide which are shown
-    /// beneath it in the grid; all of them are editable here, so a field can be
-    /// filled before it is displayed.
-    const WORD_FIELDS: [(&'static str, &'static str); 4] = [
-        ("gloss", "Gloss"),
-        ("lemma", "Lemma"),
-        ("parse", "Parsing"),
-        ("note", "Note"),
-    ];
+    /// Choose which fields are written under each word. The file format has
+    /// always allowed any name here; this is where you say so.
+    fn edit_rows(self: &Rc<Self>, anchor: &gtk::Widget) {
+        let Some(sheet) = self.sheet.borrow().clone() else { return };
+        let popover = gtk::Popover::new();
+        popover.set_parent(anchor);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        column.set_margin_top(10);
+        column.set_margin_bottom(10);
+        column.set_margin_start(10);
+        column.set_margin_end(10);
+        column.set_size_request(320, -1);
+
+        let caption = gtk::Label::new(Some("Shown under each word"));
+        caption.add_css_class("oma-group");
+        caption.set_halign(gtk::Align::Start);
+        column.append(&caption);
+
+        let entry = gtk::Entry::builder()
+            .text(sheet.rows.join(", "))
+            .placeholder_text("gloss, parse")
+            .build();
+        column.append(&entry);
+
+        let hint = gtk::Label::new(Some(
+            "Separated by commas, in the order they appear. Any name will do — \
+             gloss, lemma, parse and note are always offered when editing a word, \
+             and anything else you name here becomes a field of its own.",
+        ));
+        hint.add_css_class("dim-label");
+        hint.set_wrap(true);
+        hint.set_xalign(0.0);
+        hint.set_max_width_chars(40);
+        column.append(&hint);
+
+        let apply = gtk::Button::with_label("Apply");
+        apply.add_css_class("suggested-action");
+        apply.set_halign(gtk::Align::End);
+        column.append(&apply);
+        popover.set_child(Some(&column));
+
+        let commit = {
+            let me = self.clone();
+            let entry = entry.clone();
+            let popover = popover.clone();
+            move || {
+                let names: Vec<String> =
+                    entry.text().split(',').map(|s| s.trim().to_string()).collect();
+                {
+                    let mut held = me.sheet.borrow_mut();
+                    let Some(sheet) = held.as_mut() else { return };
+                    sheet.set_rows(&names);
+                }
+                if let Some(sheet) = me.sheet.borrow().as_ref() {
+                    me.grid.show(sheet);
+                }
+                me.dirty_doc.set(true);
+                popover.popdown();
+            }
+        };
+        {
+            let commit = commit.clone();
+            apply.connect_clicked(move |_| commit());
+        }
+        entry.connect_activate(move |_| commit());
+
+        popover.connect_closed(|p| p.unparent());
+        popover.popup();
+        // Focus once the popover is up: grabbing it synchronously, before the
+        // surface is mapped, closes the popover again.
+        glib::idle_add_local_once(move || {
+            entry.grab_focus();
+        });
+    }
+
+    /// How a field's name reads as a caption: the four standard ones have
+    /// settled spellings, and anything the sheet invents is shown as written.
+    fn field_caption(name: &str) -> String {
+        match name {
+            "gloss" => "Gloss".into(),
+            "lemma" => "Lemma".into(),
+            "parse" => "Parsing".into(),
+            "note" => "Note".into(),
+            other => {
+                let mut c = other.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            }
+        }
+    }
 
     fn edit_word(self: &Rc<Self>, id: &str) {
         let Some(word) = self.sheet.borrow().as_ref().and_then(|s| s.word(id).cloned()) else {
@@ -2579,14 +2675,20 @@ impl App {
         column.append(&text);
         column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-        let mut entries = Vec::new();
-        for (field, label) in Self::WORD_FIELDS {
-            let caption = gtk::Label::new(Some(label));
+        let names = self
+            .sheet
+            .borrow()
+            .as_ref()
+            .map(|s| s.fields())
+            .unwrap_or_default();
+        let mut entries: Vec<(String, gtk::Entry)> = Vec::new();
+        for field in names {
+            let caption = gtk::Label::new(Some(&Self::field_caption(&field)));
             caption.add_css_class("oma-group");
             caption.set_halign(gtk::Align::Start);
             column.append(&caption);
             let entry = gtk::Entry::builder()
-                .text(word.field(field).unwrap_or(""))
+                .text(word.field(&field).unwrap_or(""))
                 .activates_default(true)
                 .build();
             column.append(&entry);
@@ -2755,7 +2857,7 @@ impl App {
         }
     }
 
-    fn apply_word_edit(&self, id: &str, text: &str, entries: &[(&str, gtk::Entry)]) {
+    fn apply_word_edit(&self, id: &str, text: &str, entries: &[(String, gtk::Entry)]) {
         {
             let mut held = self.sheet.borrow_mut();
             let Some(sheet) = held.as_mut() else { return };
@@ -2937,6 +3039,7 @@ impl App {
         self.canvas.clear();
         self.to_diagram.set_visible(false);
         self.to_sheet.set_visible(false);
+        self.rows_btn.set_visible(false);
         self.related_btn.set_visible(false);
         self.folds.borrow_mut().clear();
         *self.disk_stamp.borrow_mut() = None;
@@ -3277,6 +3380,7 @@ impl App {
             hint.add_css_class("dim-label");
             hint.set_wrap(true);
             hint.set_xalign(0.0);
+            hint.set_max_width_chars(40);
             column.append(&hint);
 
             let me = self.clone();
@@ -3541,6 +3645,7 @@ impl App {
         *self.sheet.borrow_mut() = None;
         self.to_diagram.set_visible(false);
         self.to_sheet.set_visible(diagram.source.is_some());
+        self.rows_btn.set_visible(false);
         self.related_btn.set_visible(true);
         *self.path.borrow_mut() = Some(path.clone());
         self.record_stamp(path);
@@ -3610,6 +3715,7 @@ impl App {
         *self.sheet.borrow_mut() = Some(sheet);
         self.to_diagram.set_visible(true);
         self.to_sheet.set_visible(false);
+        self.rows_btn.set_visible(true);
         self.related_btn.set_visible(true);
         self.stack.set_visible_child_name("interlinear");
         self.split.set_show_sidebar(true);
