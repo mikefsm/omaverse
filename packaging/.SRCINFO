@@ -1,0 +1,21 @@
+pkgbase = omaverse
+	pkgdesc = Outline scripture, annotate the original languages, and diagram sentences — in plain files
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/mikefsm/omaverse
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = gtk4
+	depends = libadwaita
+	depends = enchant
+	depends = cairo
+	depends = pango
+	depends = glib2
+	optdepends = hunspell-en_us: spell checking in outlines
+	source = git+https://github.com/mikefsm/omaverse.git#tag=v0.1.0
+	sha256sums = SKIP
+
+pkgname = omaverse
