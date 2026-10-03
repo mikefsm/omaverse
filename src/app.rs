@@ -9,6 +9,7 @@ use crate::config::{self, Config};
 use crate::docview;
 use crate::edit::{self, Cmd};
 use crate::canvas::Canvas;
+use crate::pdfout;
 use crate::diagram::Diagram;
 use crate::interlinear::Interlinear;
 use crate::library;
@@ -110,6 +111,9 @@ pub struct App {
     gutter: RefCell<Option<gtk::DrawingArea>>,
     /// Shown only while an interlinear is open.
     to_diagram: gtk::Button,
+    /// The paper chosen last time, so the choice does not have to be made twice
+    /// in a row.
+    last_paper: Cell<usize>,
     toasts: adw::ToastOverlay,
     /// The undo offer for the last removed word. Only the most recent removal
     /// can be taken back: an older offer would put its word back at an index
@@ -303,6 +307,15 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     to_diagram.set_visible(false);
     header.pack_end(&to_diagram);
 
+    let doc_menu = gio::Menu::new();
+    doc_menu.append(Some("Export as PDF…"), Some("win.export-pdf"));
+    let doc_btn = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("This document")
+        .menu_model(&doc_menu)
+        .build();
+    header.pack_end(&doc_btn);
+
     let shell = adw::ToolbarView::new();
     shell.add_top_bar(&header);
     shell.set_content(Some(&stack));
@@ -348,6 +361,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         libbox: libbox.clone(),
         toasts: toasts.clone(),
         to_diagram: to_diagram.clone(),
+        last_paper: Cell::new(0),
         last_removal: RefCell::new(None),
         lib_paths: RefCell::new(Vec::new()),
         recent: RefCell::new(wstate.recent.clone()),
@@ -598,13 +612,20 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
         let a = app.clone();
         let keys = gtk::EventControllerKey::new();
         keys.connect_key_pressed(move |_, key, _, state| {
-            if state.contains(gdk::ModifierType::CONTROL_MASK)
-                && (key == gdk::Key::i || key == gdk::Key::I)
-            {
-                a.new_interlinear();
-                return glib::Propagation::Stop;
+            if !state.contains(gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
             }
-            glib::Propagation::Proceed
+            match key {
+                gdk::Key::i | gdk::Key::I => {
+                    a.new_interlinear();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::p | gdk::Key::P => {
+                    a.export_pdf();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
         });
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         window.add_controller(keys);
@@ -629,6 +650,10 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     add_action(&window, "new-interlinear", {
         let a = app.clone();
         move || a.new_interlinear()
+    });
+    add_action(&window, "export-pdf", {
+        let a = app.clone();
+        move || a.export_pdf()
     });
     add_action(&window, "make-diagram", {
         let a = app.clone();
@@ -662,6 +687,7 @@ pub fn build(gapp: &adw::Application, cli: Option<PathBuf>) -> Rc<App> {
     // Ctrl+I, not Ctrl+Shift+N: a two-modifier accelerator never fires here,
     // the same reason redo had to be handled by hand.
     gapp.set_accels_for_action("win.new-interlinear", &["<Primary>i"]);
+    gapp.set_accels_for_action("win.export-pdf", &["<Primary>p"]);
     gapp.set_accels_for_action("win.open-outline", &["<Primary>o"]);
     gapp.set_accels_for_action("win.close", &["<Primary>w", "<Primary>q"]);
     gapp.set_accels_for_action("win.undo", &["<Primary>z"]);
@@ -2652,6 +2678,124 @@ impl App {
             Err(e) => {
                 eprintln!("omaverse: could not save {}: {e}", path.display());
                 self.wtitle.set_subtitle(&format!("Not saved — {e}"));
+                self.wtitle.add_css_class("oma-error");
+            }
+        }
+    }
+
+    // ---- printing ----------------------------------------------------------
+
+    /// Ask for paper and orientation, then where to put it. Every kind of
+    /// document can be printed; what differs is how it is laid out.
+    fn export_pdf(self: &Rc<Self>) {
+        if self.path.borrow().is_none() {
+            self.wtitle.set_subtitle("Nothing open to export");
+            return;
+        }
+        let dlg = adw::AlertDialog::new(Some("Export as PDF"), None);
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        column.set_margin_top(6);
+
+        let papers: Vec<&str> = pdfout::Paper::all().iter().map(|p| p.label()).collect();
+        let paper = gtk::DropDown::from_strings(&papers);
+        paper.set_selected(self.last_paper.get() as u32);
+        let turns: Vec<&str> = pdfout::Orientation::all().iter().map(|o| o.label()).collect();
+        let turn = gtk::DropDown::from_strings(&turns);
+        // A diagram wants the page on its side; prose does not.
+        let wide = self.canvas.take().is_some();
+        turn.set_selected(if wide { 1 } else { 0 });
+
+        for (caption, widget) in [
+            ("Paper", paper.clone().upcast::<gtk::Widget>()),
+            ("Orientation", turn.clone().upcast::<gtk::Widget>()),
+        ] {
+            let label = gtk::Label::new(Some(caption));
+            label.add_css_class("oma-group");
+            label.set_halign(gtk::Align::Start);
+            column.append(&label);
+            column.append(&widget);
+        }
+        dlg.set_extra_child(Some(&column));
+        dlg.add_response("cancel", "Cancel");
+        dlg.add_response("export", "Export");
+        dlg.set_response_appearance("export", adw::ResponseAppearance::Suggested);
+        dlg.set_default_response(Some("export"));
+        dlg.set_close_response("cancel");
+
+        let me = self.clone();
+        dlg.connect_response(None, move |_, answer| {
+            if answer != "export" {
+                return;
+            }
+            let paper = pdfout::Paper::all()[paper.selected() as usize];
+            let turn = pdfout::Orientation::all()[turn.selected() as usize];
+            me.last_paper.set(paper as u8 as usize);
+            me.choose_pdf_path(pdfout::Sheet::new(paper, turn));
+        });
+        dlg.present(Some(&self.window));
+    }
+
+    fn choose_pdf_path(self: &Rc<Self>, sheet: pdfout::Sheet) {
+        let stem = self
+            .path
+            .borrow()
+            .as_ref()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "document".to_string());
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        let pdf = gtk::FileFilter::new();
+        pdf.set_name(Some("PDF"));
+        pdf.add_suffix("pdf");
+        filters.append(&pdf);
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Export as PDF")
+            .accept_label("Export")
+            .initial_folder(&self.chooser_start_dir())
+            .initial_name(format!("{stem}.pdf"))
+            .filters(&filters)
+            .default_filter(&pdf)
+            .modal(true)
+            .build();
+        let me = self.clone();
+        dialog.save(Some(&self.window), gio::Cancellable::NONE, move |res| {
+            if let Some(path) = res.ok().and_then(|f| f.path()) {
+                me.write_pdf(&path, sheet);
+            }
+        });
+    }
+
+    fn write_pdf(&self, chosen: &Path, sheet: pdfout::Sheet) {
+        let text = chosen.to_string_lossy();
+        let path = if text.ends_with(".pdf") {
+            chosen.to_path_buf()
+        } else {
+            PathBuf::from(format!("{text}.pdf"))
+        };
+
+        let written = if let Some(doc) = self.sheet.borrow().as_ref() {
+            pdfout::export_interlinear(&path, doc, sheet)
+        } else if let Some(doc) = self.canvas.take() {
+            pdfout::export_diagram(&path, &doc, sheet)
+        } else {
+            // Folding is for reading, not for printing: the whole outline goes.
+            let full = self.full_text();
+            let title = crate::parse::parse(&full).title.unwrap_or_default();
+            pdfout::export_outline(&path, &full, &title, sheet)
+        };
+
+        match written {
+            Ok(pages) => {
+                let leaves = if pages == 1 { "page" } else { "pages" };
+                self.wtitle
+                    .set_subtitle(&format!("{} — {pages} {leaves}", self.pretty(&path)));
+                self.wtitle.remove_css_class("oma-error");
+                let toast = adw::Toast::new(&format!("Exported {}", self.pretty(&path)));
+                self.toasts.add_toast(toast);
+            }
+            Err(e) => {
+                eprintln!("omaverse: could not export {}: {e}", path.display());
+                self.wtitle.set_subtitle(&format!("Could not export — {e}"));
                 self.wtitle.add_css_class("oma-error");
             }
         }

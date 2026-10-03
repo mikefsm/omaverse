@@ -9,6 +9,7 @@ mod library;
 mod model;
 mod nodeobj;
 mod parse;
+mod pdfout;
 mod reference;
 mod spell;
 mod state;

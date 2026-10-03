@@ -13,6 +13,7 @@ anyhow = "1"
 toml = "1.1.6"
 enchant = "0.3.0"
 pangocairo = "0.22.9"
+cairo-rs = { version = "0.22.9", features = ["pdf"] }
 
 [profile.release]
 opt-level = 2

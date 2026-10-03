@@ -478,6 +478,7 @@ name = "omaverse"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cairo-rs",
  "enchant",
  "gtk4",
  "libadwaita",
